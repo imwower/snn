@@ -1,0 +1,21 @@
+services:
+  nats:
+    image: nats:2
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - ./.data/nats:/data
+      - ./nats.conf:/etc/nats/nats.conf:ro
+
+  nats-ui:
+    image: ghcr.io/nats-nui/nui:latest
+    depends_on:
+      - nats
+    environment:
+      - NATS_URL=nats://nats:4222
+    ports:
+      - "31311:31311"
+    volumes:
+      - ./.data/nui:/db
