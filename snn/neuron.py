@@ -15,9 +15,45 @@ derivations or empirical event streams, as described in the project README.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Sequence, List
 
+import yaml
+
+
+# 读取配置文件中的日志级别，默认值为 INFO。
+def _load_log_level(default_level: int = logging.INFO) -> int:
+    """Load log level from config.yaml, falling back to the provided default."""
+
+    # config.yaml 与仓库根目录对齐，因此需要向上一级目录查找。
+    config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    if not config_path.exists():
+        return default_level
+
+    try:
+        with config_path.open("r", encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file) or {}
+    except Exception:
+        return default_level
+
+    level_name = (
+        (config.get("logging") or {}).get("level") if isinstance(config, dict) else None
+    )
+    if not isinstance(level_name, str):
+        return default_level
+
+    level_value = getattr(logging, level_name.upper(), None)
+    if isinstance(level_value, int):
+        return level_value
+    return default_level
+
+
+_LOG_LEVEL = _load_log_level()
+logging.basicConfig(level=_LOG_LEVEL)
+logger = logging.getLogger(__name__)
+logger.setLevel(_LOG_LEVEL)
 
 @dataclass(frozen=True)
 class ThreeCompartmentParams:
@@ -65,12 +101,28 @@ class ThreeCompartmentNeuron:
         self._refractory_time_remaining = 0.0
         self.time = 0.0
         self._set_initial_potentials(initial_potentials)
+        # 神经元初始化完成后记录当前状态，便于调试。
+        logger.debug(
+            "神经元初始化完成，dt=%.4e, 阈值=%.3f, 初始电位=(soma=%.3f, apical=%.3f, basal=%.3f)",
+            self.params.dt,
+            self.params.threshold,
+            self.v_soma,
+            self.v_apical,
+            self.v_basal,
+        )
 
     def _set_initial_potentials(self, initial_potentials: Optional[dict]) -> None:
         defaults = initial_potentials or {}
         self.v_soma = float(defaults.get("soma", self.params.v_rest))
         self.v_apical = float(defaults.get("apical", self.params.v_rest))
         self.v_basal = float(defaults.get("basal", self.params.v_rest))
+        # 记录初始电位，用于追踪启动条件。
+        logger.debug(
+            "设置初始膜电位：soma=%.3f, apical=%.3f, basal=%.3f",
+            self.v_soma,
+            self.v_apical,
+            self.v_basal,
+        )
 
     def reset(self, *, initial_potentials: Optional[dict] = None) -> None:
         """Reset membrane potentials and internal timers."""
@@ -78,6 +130,8 @@ class ThreeCompartmentNeuron:
         self._refractory_time_remaining = 0.0
         self.time = 0.0
         self._set_initial_potentials(initial_potentials)
+        # 重置神经元时输出调试日志。
+        logger.debug("神经元状态已重置，时间轴归零。")
 
     def step(
         self,
@@ -98,6 +152,14 @@ class ThreeCompartmentNeuron:
 
         p = self.params
         dt = p.dt
+        # 记录输入电流，帮助定位异常输入。
+        logger.debug(
+            "步进开始：t=%.4f, 输入电流(apical=%.4f, basal=%.4f, soma=%.4f)",
+            self.time,
+            apical_current,
+            basal_current,
+            soma_current,
+        )
 
         # Update dendrites first so the soma can observe their fresh potentials.
         apical_leak = (p.v_rest - self.v_apical) / p.tau_apical
@@ -124,11 +186,27 @@ class ThreeCompartmentNeuron:
                 spike = True
                 new_soma = p.reset_potential
                 self._refractory_time_remaining = p.refractory_period
+                # 记录触发脉冲的详细信息。
+                logger.debug(
+                    "检测到脉冲：t=%.4f, 膜电位超过阈值 %.3f，进入不应期 %.4e",
+                    self.time + dt,
+                    p.threshold,
+                    p.refractory_period,
+                )
 
         self.v_apical = new_apical
         self.v_basal = new_basal
         self.v_soma = new_soma
         self.time += dt
+        # 输出此次步进后的膜电位变化。
+        logger.debug(
+            "步进结束：t=%.4f, 膜电位(soma=%.3f, apical=%.3f, basal=%.3f), spike=%s",
+            self.time,
+            self.v_soma,
+            self.v_apical,
+            self.v_basal,
+            spike,
+        )
 
         return CompartmentState(
             time=self.time,
@@ -173,5 +251,8 @@ class ThreeCompartmentNeuron:
         history: List[CompartmentState] = []
         for ap_current, ba_current, so_current in zip(apical, basal, soma_seq):
             history.append(self.step(ap_current, ba_current, so_current))
+
+        # 运行结束后记录总步数，便于追踪模拟长度。
+        logger.debug("运行结束，总步数=%d，最终时间=%.4f", len(history), self.time)
 
         return history
