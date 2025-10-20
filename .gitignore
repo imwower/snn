@@ -4,3 +4,5 @@ __pycache__/
 .idea
 /.data/nats/
 /.data/nui/
+/.venv/
+/ui-vue/node_modules/
