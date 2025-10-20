@@ -1,16 +1,10 @@
-"""Three-compartment leaky integrate-and-fire neuron implementation.
+"""三腔室泄漏积分发放 (LIF) 神经元实现。
 
-The module implements a minimalist three-compartment neuron (soma, apical and
-basal dendrites) that can be stepped explicitly or driven by pre-computed
-currents.  The equations are written in discrete time using an Euler scheme so
-they can be plugged into fixed-point solvers or classic time-stepped training
-loops.
+本模块提供一个最小化的三腔室模型（胞体、树突顶端与树突基底），可按步推进或接受预先计算的电流序列。
+模型采用离散时间的欧拉显式求解器，可直接嵌入固定步长的训练循环或定点求解流程。
 
-The model keeps the number of parameters intentionally small: the coupling
-constants determine how strongly dendritic compartments pull the soma membrane,
-and the provided currents are interpreted as voltage change rates per unit time.
-This makes it straightforward to connect the neuron to either analytical
-derivations or empirical event streams, as described in the project README.
+参数数量保持精简：耦合常数控制树突对胞体电位的影响，输入电流被解释为单位时间的电位变化率。
+因此可以更方便地衔接解析推导或事件流数据，具体细节参考项目 README。
 """
 
 from __future__ import annotations
@@ -25,7 +19,7 @@ import yaml
 
 # 读取配置文件中的日志级别，默认值为 INFO。
 def _load_log_level(default_level: int = logging.INFO) -> int:
-    """Load log level from config.yaml, falling back to the provided default."""
+    """从 config.yaml 读取日志级别，不存在时回退到传入的默认值。"""
 
     # config.yaml 与仓库根目录对齐，因此需要向上一级目录查找。
     config_path = Path(__file__).resolve().parent.parent / "config.yaml"
@@ -57,12 +51,10 @@ logger.setLevel(_LOG_LEVEL)
 
 @dataclass(frozen=True)
 class ThreeCompartmentParams:
-    """Hyper-parameters that govern the neuron dynamics.
+    """定义神经元动力学的超参数。
 
-    All membrane potentials are modelled in volts while time is expressed in
-    seconds.  Input currents are used as voltage change rates (volt/second) to
-    keep the implementation dependency-free; callers can rescale their inputs to
-    match the desired physical setting.
+    所有膜电位使用伏特表示，时间使用秒。输入电流表示单位时间内的电位变化率（伏/秒），
+    以保持实现的轻量化；调用方可根据物理场景自行缩放。
     """
 
     dt: float = 1e-3
@@ -79,7 +71,7 @@ class ThreeCompartmentParams:
 
 @dataclass
 class CompartmentState:
-    """Snapshot of the membrane potentials after a simulation step."""
+    """记录单步仿真后的膜电位快照。"""
 
     time: float
     soma: float
@@ -89,7 +81,7 @@ class CompartmentState:
 
 
 class ThreeCompartmentNeuron:
-    """Explicit Euler solver for a three-compartment leaky integrate-and-fire neuron."""
+    """三腔室泄漏积分发放神经元的欧拉显式求解器。"""
 
     def __init__(
         self,
@@ -125,7 +117,7 @@ class ThreeCompartmentNeuron:
         )
 
     def reset(self, *, initial_potentials: Optional[dict] = None) -> None:
-        """Reset membrane potentials and internal timers."""
+        """重置膜电位与内部计时器。"""
 
         self._refractory_time_remaining = 0.0
         self.time = 0.0
@@ -139,15 +131,15 @@ class ThreeCompartmentNeuron:
         basal_current: float,
         soma_current: float = 0.0
     ) -> CompartmentState:
-        """Advance the neuron by a single time step.
+        """按单个时间步推进神经元状态。
 
         Args:
-            apical_current: Input current driving the apical dendrite.
-            basal_current: Input current driving the basal dendrite.
-            soma_current: Optional direct current applied to the soma.
+            apical_current: 施加在树突顶端的输入电流。
+            basal_current: 施加在树突基底的输入电流。
+            soma_current: 直接作用于胞体的附加电流，默认为 0。
 
         Returns:
-            CompartmentState with updated membrane potentials and spike flag.
+            返回更新后的膜电位及放电标记。
         """
 
         p = self.params
@@ -161,7 +153,7 @@ class ThreeCompartmentNeuron:
             soma_current,
         )
 
-        # Update dendrites first so the soma can observe their fresh potentials.
+        # 先更新树突电位，使胞体读取到最新状态。
         apical_leak = (p.v_rest - self.v_apical) / p.tau_apical
         apical_coupling = p.coupling_apical * (self.v_soma - self.v_apical)
         new_apical = self.v_apical + dt * (apical_leak + apical_coupling + apical_current)
@@ -175,6 +167,11 @@ class ThreeCompartmentNeuron:
         if self._refractory_time_remaining > 0.0:
             self._refractory_time_remaining = max(0.0, self._refractory_time_remaining - dt)
             new_soma = p.reset_potential
+            logger.debug(
+                "处于不应期：剩余时间=%.4e，胞体电位保持在重置值 %.3f",
+                self._refractory_time_remaining,
+                new_soma,
+            )
         else:
             soma_leak = (p.v_rest - self.v_soma) / p.tau_soma
             soma_coupling = (
@@ -222,31 +219,31 @@ class ThreeCompartmentNeuron:
         basal_currents: Sequence[float],
         soma_currents: Optional[Sequence[float]] = None
     ) -> List[CompartmentState]:
-        """Simulate the neuron for a sequence of inputs.
+        """使用输入序列驱动神经元仿真。
 
         Args:
-            apical_currents: Sequence of apical currents (length T).
-            basal_currents: Sequence of basal currents (length T).
-            soma_currents: Optional sequence of soma currents; defaults to zeros.
+            apical_currents: 树突顶端电流序列，长度为 T。
+            basal_currents: 树突基底电流序列，长度为 T。
+            soma_currents: 可选的胞体电流序列，默认为全零。
 
         Returns:
-            List of CompartmentState snapshots (length T).
+            返回长度为 T 的 `CompartmentState` 列表。
 
         Raises:
-            ValueError: if the input sequences do not share the same length.
+            ValueError: 当输入序列长度不一致时抛出。
         """
 
         apical = list(apical_currents)
         basal = list(basal_currents)
         if len(apical) != len(basal):
-            raise ValueError("apical_currents and basal_currents must have the same length")
+            raise ValueError("apical_currents 与 basal_currents 的长度必须一致")
 
         if soma_currents is None:
             soma_seq = [0.0] * len(apical)
         else:
             soma_seq = list(soma_currents)
             if len(soma_seq) != len(apical):
-                raise ValueError("soma_currents must match the length of dendritic inputs")
+                raise ValueError("soma_currents 的长度需要匹配树突输入序列")
 
         history: List[CompartmentState] = []
         for ap_current, ba_current, so_current in zip(apical, basal, soma_seq):
