@@ -90,34 +90,34 @@ npm run dev
 
 ## 6) 事件流与数据约定（SSE `/events`）
 
-| 事件名            | 说明                               | 核心字段（取自 `ui-vue/src/types.ts`） |
-|-------------------|------------------------------------|----------------------------------------|
-| `config`          | 初始配置快照（可选）               | `training`（同 `TrainInitEvent`）      |
-| `train_init`      | 训练参数初始化                     | `dataset`, `epochs`, `fixed_point_K`, `timesteps`, `lr`, `hidden`, `layers` |
-| `train_iter`      | 固定点迭代残差/进度                | `epoch`, `step`, `k`, `residual`, `layer` |
-| `metrics_batch`   | 批次指标                           | `loss`, `acc`, `top5`, `throughput`, `step_ms`, `ema_loss`, `ema_acc`, `lr`, `examples` |
-| `metrics_epoch`   | Epoch 汇总指标                     | `loss`, `acc`, `best_acc`, `best_loss`, `avg_throughput`, `epoch_sec` |
-| `spike`           | 脉冲可视化事件                     | `layer`, `t`, `neurons`, `edges`, `power` |
-| `log`             | 系统/训练日志行                    | `level`, `msg`, `time_unix`            |
-| `dataset_download`| 数据集下载状态                     | `name`, `state`, `progress`, `message` |
-| `train_status`    | 训练状态广播（Idle/Training 等）   | `status`                               |
+后端需为每个连接维护独立的推送队列。所有事件采用 `event: <name>` / `data: <json>\n\n` 形式发送，并使用毫秒级 Unix 时间戳（`time_unix` 字段）保持客户端时间轴一致。事件负载与 `ui-vue/src/types.ts` 中的接口保持一对一映射：
 
-- 时间戳字段统一使用毫秒 Unix 时间（`time_unix`）。
-- UI 会维护最多 500 条指标与日志，可根据需要调整 `ui-vue/src/store/ui.ts` 中的常量。
+- `train_init` → `TrainInitEvent`：初始化训练参数，字段包括 `dataset`、`epochs`、`fixed_point_K`、`fixed_point_tol`、`timesteps`、`hidden`、`layers`、`lr`。
+- `train_status` → `{ status: TrainingStatus }`：广播 `Idle` / `Initializing` / `Training` / `Stopped` / `Error`。
+- `train_iter` → `TrainIterEvent`：固定点残差进度，携带 `epoch`、`step`、`k`、`layer`、`residual`。
+- `metrics_batch` / `metrics_epoch` → `MetricPayload`：分别代表批次指标与 epoch 汇总，字段覆盖 `loss`、`acc`、`top5`、`throughput`、`step_ms`、`ema_loss`、`ema_acc`、`lr`、`examples`、`best_acc`、`best_loss`、`avg_throughput`、`epoch_sec`。
+- `spike` → `SpikePayload`：实时脉冲，可选 `edges` 与功率 `power`。
+- `log` → `UISysLogEvent` 或 `LogPayload`：用于 UI 控制台和 Toast，需提供 `level`、`msg` / `message`。
+- `dataset_download` → `DatasetDownloadEvent`：三态状态机：`start`、`progress`、`complete`（如失败可回传 `error` 并附带 `message`）。
+- `config`（可选）→ `{ training: TrainInitEvent }`：在连接建立时推送最新配置快照。
+
+UI 默认缓存 500 条指标与日志（参见 `ui-vue/src/store/ui.ts`），若后端事件过于频繁建议在服务侧做节流。
 
 ## 7) REST 接口约定（由后端提供）
 
-| 方法 | 路径                     | 说明                     | 请求体要点 |
-|------|-------------------------|--------------------------|------------|
-| GET  | `/api/config`           | 返回当前训练配置         | `{ "training": TrainInitEvent }`（可选） |
-| GET  | `/api/datasets`         | 数据集列表               | 任意组合 `{datasets, available, installed}`，元素可为字符串或对象 |
-| POST | `/api/datasets/download`| 触发数据集下载           | `{ name: DatasetName }` |
-| POST | `/api/train/init`       | 写入训练配置但不启动     | `TrainingConfig` 或兼容字段 |
-| POST | `/api/train/start`      | 开始训练                 | `{}`（如需参数可扩展） |
-| POST | `/api/train/stop`       | 停止训练                 | `{}` |
-| GET  | `/events`               | SSE 通道                 | 按第 6 节推送事件 |
+与 `Sidebar.vue`、`ws.ts` 所使用的 axios/fetch 调用保持一致，所有响应以 JSON 返回，错误情况建议包含 `{ "message": "...", "detail": ... }` 便于前端展示。
 
-所有接口返回 JSON；失败状态建议返回 `{ "message": "...", "detail": ... }` 便于 UI 在 Toast 中展示。
+| 方法 | 路径 | 请求体 | 成功响应（示例） | 说明 |
+|------|------|--------|-----------------|------|
+| GET | `/api/config` | — | `{ "training": TrainInitEvent, "status": "Idle" }` | 返回最近一次初始化参数与当前训练状态 |
+| GET | `/api/datasets` | — | `{ "datasets": [{ "name": "MNIST", "installed": true, "progress": 100 }] }` | 供侧边栏渲染数据集下拉及安装状态 |
+| POST | `/api/datasets/download` | `{ "name": DatasetName }` | `{ "ok": true, "message": "download scheduled" }` | 触发数据集下载，并通过 `dataset_download` 事件汇报进度 |
+| POST | `/api/train/init` | `TrainingConfig` | `{ "ok": true }` | 写入训练配置，同时发布 `train_init` 事件 |
+| POST | `/api/train/start` | `{}` | `{ "ok": true }`（202 Accepted） | 启动训练流水线，后续事件见第 6 节 |
+| POST | `/api/train/stop` | `{}` | `{ "ok": true }` | 请求停止当前训练，完成后应广播 `train_status: Stopped` |
+| GET | `/events` | — | `text/event-stream` | Server-Sent Events 长连接 |
+
+配合 `uvicorn snn.server:create_app --host 0.0.0.0 --port 8000` 即可提供 UI 预期的后端服务；如需切换消息队列，可修改 `config.yaml` 中的 `message_queue.backend` 或在启动时调用 `create_app({"backend": "memory"})` 覆盖默认配置。
 
 ## 8) 自定义与二次开发建议
 

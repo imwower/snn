@@ -85,22 +85,9 @@ class MessageQueueFactoryTests(unittest.TestCase):
         if not NATS_AVAILABLE:
             self.skipTest("本地环境未安装 nats-py，跳过 NATS 集成测试")
 
-        cfg = {
-            "backend": "nats",
-            "nats": {
-                "servers": ["nats://127.0.0.1:4222"],
-                "stream": "snn_events_test",
-                "subject": "training.events.test",
-                "durable": "snn-test-worker",
-                "connect": True,
-                "timeout": 1.0,
-                "allow_reconnect": False,
-            },
-        }
-
         queue = None
         try:
-            queue = build_message_queue(cfg)
+            queue = build_message_queue({"backend": "nats", "nats": {"timeout": 1.0, "allow_reconnect": False}})
         except Exception as exc:
             self.fail(f"NATS 服务器不可用或连接失败：{exc}")
             return

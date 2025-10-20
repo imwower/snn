@@ -10,6 +10,7 @@ from .mq import (
     build_message_queue,
 )
 from .neuron import CompartmentState, ThreeCompartmentNeuron, ThreeCompartmentParams
+from .server import create_app
 
 __all__ = [
     "ThreeCompartmentNeuron",
@@ -26,4 +27,5 @@ __all__ = [
     "InMemoryQueue",
     "NatsJetStreamQueue",
     "build_message_queue",
+    "create_app",
 ]
