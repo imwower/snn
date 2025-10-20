@@ -1,2 +1,12 @@
 logging:
   level: INFO
+
+message_queue:
+  backend: nats
+  nats:
+    servers:
+      - nats://127.0.0.1:4222
+    stream: snn_events
+    subject: training.events
+    durable: snn-worker
+    connect: true

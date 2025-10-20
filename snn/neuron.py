@@ -11,40 +11,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Sequence, List
 
-import yaml
+from .config import get_logging_level
 
 
-# 读取配置文件中的日志级别，默认值为 INFO。
-def _load_log_level(default_level: int = logging.INFO) -> int:
-    """从 config.yaml 读取日志级别，不存在时回退到传入的默认值。"""
-
-    # config.yaml 与仓库根目录对齐，因此需要向上一级目录查找。
-    config_path = Path(__file__).resolve().parent.parent / "config.yaml"
-    if not config_path.exists():
-        return default_level
-
-    try:
-        with config_path.open("r", encoding="utf-8") as config_file:
-            config = yaml.safe_load(config_file) or {}
-    except Exception:
-        return default_level
-
-    level_name = (
-        (config.get("logging") or {}).get("level") if isinstance(config, dict) else None
-    )
-    if not isinstance(level_name, str):
-        return default_level
-
-    level_value = getattr(logging, level_name.upper(), None)
-    if isinstance(level_value, int):
-        return level_value
-    return default_level
-
-
-_LOG_LEVEL = _load_log_level()
+_LOG_LEVEL = get_logging_level()
 logging.basicConfig(level=_LOG_LEVEL)
 logger = logging.getLogger(__name__)
 logger.setLevel(_LOG_LEVEL)
