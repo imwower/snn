@@ -8,6 +8,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from contextlib import asynccontextmanager
@@ -104,6 +105,8 @@ class DatasetService:
 
     def __init__(self, broker: EventBroker) -> None:
         self._broker = broker
+        self._data_root = Path(__file__).resolve().parent.parent / ".data" / "datasets"
+        self._data_root.mkdir(parents=True, exist_ok=True)
         self._records: Dict[str, DatasetRecord] = {
             "MNIST": DatasetRecord(name="MNIST", installed=True),
             "FASHION": DatasetRecord(name="FASHION", installed=False, progress=0.0),
@@ -111,8 +114,10 @@ class DatasetService:
         }
         self._download_task: Optional[asyncio.Task[None]] = None
         self._lock = asyncio.Lock()
+        self._refresh_installation()
 
     def list_datasets(self) -> Dict[str, List[Dict[str, Any]]]:
+        self._refresh_installation()
         payload = [
             {
                 "name": record.name,
@@ -131,6 +136,7 @@ class DatasetService:
             record = self._records.setdefault(name, DatasetRecord(name=name, installed=False, progress=0.0))
             record.progress = 0.0
             record.installed = False
+            record.message = None
             self._download_task = asyncio.create_task(self._run_download(record))
 
     async def _run_download(self, record: DatasetRecord) -> None:
@@ -150,10 +156,57 @@ class DatasetService:
                 }
                 if progress >= 1.0:
                     record.installed = True
+                    self._materialize_dataset(record)
                 await self._broker.publish("dataset_download", event_payload)
         finally:
             async with self._lock:
                 self._download_task = None
+        if record.progress < 100.0:
+            await self._broker.publish(
+                "dataset_download",
+                {
+                    "name": record.name,
+                    "state": "complete",
+                    "progress": record.progress,
+                    "time_unix": _current_millis(),
+                },
+            )
+
+    def _dataset_path(self, name: str) -> Path:
+        safe = "".join((ch.lower() if ch.isalnum() or ch in {"-", "_"} else "_") for ch in name.strip())
+        safe = safe or "dataset"
+        return self._data_root / safe
+
+    def _materialize_dataset(self, record: DatasetRecord) -> None:
+        dataset_dir = self._dataset_path(record.name)
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            "name": record.name,
+            "downloaded_at": time.time(),
+            "description": f"Placeholder dataset for {record.name}",
+        }
+        metadata_path = dataset_dir / "metadata.json"
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        sample_path = dataset_dir / "sample.txt"
+        if not sample_path.exists():
+            sample_path.write_text(
+                "This file represents downloaded data for dataset "
+                f"{record.name}. Replace with actual dataset contents as needed.\n",
+                encoding="utf-8",
+            )
+        record.installed = True
+        record.progress = 100.0
+
+    def _refresh_installation(self) -> None:
+        for record in self._records.values():
+            dataset_dir = self._dataset_path(record.name)
+            if dataset_dir.exists():
+                record.installed = True
+                record.progress = 100.0
+                record.message = None
+            else:
+                record.installed = False
+                record.progress = 0.0
 
 
 class TrainingService:

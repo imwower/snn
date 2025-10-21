@@ -1,6 +1,8 @@
 import asyncio
 import unittest
+from pathlib import Path
 from typing import List, Tuple
+import shutil
 
 from httpx import ASGITransport, AsyncClient
 
@@ -69,6 +71,14 @@ class ServerInterfaceTests(unittest.TestCase):
             config_payload = resp.json()
             self.assertEqual(config_payload.get("status"), "Idle")
             self.assertEqual(config_payload["training"]["dataset"], "MNIST")
+
+            dataset_dir = Path(".data") / "datasets" / "mnist"
+            self.assertTrue(dataset_dir.exists(), "MNIST 数据集目录应写入 .data/datasets")
+            self.assertTrue(
+                (dataset_dir / "metadata.json").exists(), "下载完成后应生成 metadata.json 文件用于标识"
+            )
+            self.assertTrue((dataset_dir / "sample.txt").exists())
+            shutil.rmtree(Path(".data"), ignore_errors=True)
 
 
 if __name__ == "__main__":
