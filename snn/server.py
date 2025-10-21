@@ -241,6 +241,25 @@ class TrainingService:
     async def init_training(self, payload: TrainingInitRequest) -> None:
         async with self._lock:
             self._config = payload.model_dump()
+        logger.info(
+            "初始化训练参数：dataset=%s, mode=%s, epochs=%d, layers=%d, network_size=%d",
+            payload.dataset,
+            payload.mode,
+            payload.epochs,
+            payload.layers,
+            payload.network_size,
+        )
+        await self._broker.publish(
+            "log",
+            {
+                "level": "INFO",
+                "msg": (
+                    f"初始化训练参数 dataset={payload.dataset} mode={payload.mode} "
+                    f"epochs={payload.epochs} layers={payload.layers} neurons={payload.network_size}"
+                ),
+                "time_unix": _current_millis(),
+            },
+        )
         await self._broker.publish(
             "train_init",
             {
@@ -395,6 +414,7 @@ def create_app(message_queue_config: Optional[Dict[str, Any]] = None) -> FastAPI
 
     @app.post("/api/train/init")
     async def init_training(request: TrainingInitRequest) -> JSONResponse:
+        logger.info("接收到训练初始化请求：dataset=%s", request.dataset)
         await training_service.init_training(request)
         return JSONResponse({"ok": True})
 

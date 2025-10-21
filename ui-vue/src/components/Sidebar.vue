@@ -185,6 +185,8 @@ const downloadDataset = () =>
 const initTraining = () =>
   withBusy(async () => {
     try {
+      store.pushPlainLog(`发送训练初始化请求：${store.cfg.dataset}`, 'INFO');
+      console.info('[UI] init training payload', store.cfg);
       store.setStatus('Initializing');
       await axios.post('/api/train/init', {
         dataset: store.cfg.dataset,
@@ -198,10 +200,12 @@ const initTraining = () =>
         epochs: store.cfg.epochs
       });
       store.setStatus('Idle');
+      store.pushPlainLog(`训练初始化完成：${store.cfg.dataset}`, 'INFO');
     } catch (err) {
       console.warn('Init failed', err);
       store.showToast('初始化训练失败', 'error');
       store.setStatus('Idle');
+      store.pushPlainLog('训练初始化失败', 'ERROR');
     }
   });
 
