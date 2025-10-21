@@ -354,12 +354,7 @@ class TrainingService:
 
 
 def _build_broker(message_queue_config: Optional[Dict[str, Any]]) -> Tuple[EventBroker, MessageQueue]:
-    mq: MessageQueue
-    try:
-        mq = build_message_queue(message_queue_config)
-    except RuntimeError as exc:
-        logger.warning("创建消息队列失败：%s，回退到内存实现。", exc)
-        mq = InMemoryQueue()
+    mq: MessageQueue = build_message_queue(message_queue_config)
     broker = EventBroker(mq)
     return broker, mq
 

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Coroutine, Dict, Iterable, List, Optional
 
 from .config import get_message_queue_config
 
@@ -112,6 +113,10 @@ class NatsJetStreamQueue(MessageQueue):
 
         self._loop = loop or asyncio.new_event_loop()
         self._owns_loop = loop is None
+        self._loop_thread: Optional[threading.Thread] = None
+        if self._owns_loop:
+            self._loop_thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+            self._loop_thread.start()
         self._nats = NATS()
         self._jetstream = None
         self._connected = False
@@ -134,21 +139,24 @@ class NatsJetStreamQueue(MessageQueue):
             try:
                 await self._jetstream.add_stream(name=self._stream, subjects=[self._subject])
             except NatsError:
-                # 流已存在时忽略错误。
                 pass
             self._connected = True
 
-        self._loop.run_until_complete(_connect())
+        self._submit(_connect())
         logger.info("已连接 NATS JetStream：stream=%s, subject=%s", self._stream, self._subject)
+
+    def _submit(self, coro: Coroutine[Any, Any, Any]) -> None:
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        future.result(timeout=self._request_timeout)
 
     def publish(self, subject: str, data: bytes, *, headers: Optional[Dict[str, str]] = None) -> None:
         self._ensure_connected()
-        assert self._jetstream is not None  # 类型提示
+        assert self._jetstream is not None
 
         async def _publish() -> None:
             await self._jetstream.publish(subject, payload=data, headers=headers or {})
 
-        self._loop.run_until_complete(_publish())
+        self._submit(_publish())
 
     def pull(self, subject: str, *, max_messages: int = 1) -> List[Message]:
         self._ensure_connected()
@@ -167,7 +175,8 @@ class NatsJetStreamQueue(MessageQueue):
                 await msg.ack()
             return result
 
-        return self._loop.run_until_complete(_pull())
+        future = asyncio.run_coroutine_threadsafe(_pull(), self._loop)
+        return future.result(timeout=self._request_timeout)
 
     def close(self) -> None:
         if not self._connected:
@@ -176,10 +185,12 @@ class NatsJetStreamQueue(MessageQueue):
         async def _close() -> None:
             await self._nats.drain()
 
-        self._loop.run_until_complete(_close())
+        self._submit(_close())
         self._connected = False
         if self._owns_loop:
-            self._loop.close()
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            if self._loop_thread is not None:
+                self._loop_thread.join(timeout=self._request_timeout)
 
 
 def build_message_queue(config: Optional[Dict[str, object]] = None) -> MessageQueue:
