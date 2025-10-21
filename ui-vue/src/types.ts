@@ -64,6 +64,8 @@ export interface SpikePayload {
   neurons: number[];
   edges?: [number, number][];
   power?: number;
+  apical_trace?: number[];
+  basal_trace?: number[];
 }
 
 export interface SpikeEntry extends SpikePayload {
