@@ -497,13 +497,13 @@ class TrainingService:
         self._config: Dict[str, Any] = {
             "dataset": "MNIST",
             "mode": "fpt",
-            "network_size": 256,
-            "layers": 3,
-            "lr": 5e-3,
+            "network_size": 128,
+            "layers": 2,
+            "lr": 1e-3,
             "K": 4,
             "tol": 1e-5,
             "T": 12,
-            "epochs": 6,
+            "epochs": 20,
         }
         self._task: Optional[asyncio.Task[None]] = None
         self._stop_event = asyncio.Event()
@@ -762,6 +762,24 @@ class TrainingService:
                     if spike_payload is not None:
                         await self._broker.publish("spike", spike_payload)
 
+                    ema_loss_str = f"{ema_loss:.4f}" if ema_loss is not None else "nan"
+                    ema_acc_str = f"{ema_acc:.4f}" if ema_acc is not None else "nan"
+                    logger.info(
+                        "[BATCH] ep=%d st=%d loss=%.4f acc=%.4f top5=%.4f tps=%.1f step_ms=%.1f ema_loss=%s "
+                        "ema_acc=%s lr=%.5f examples=%d",
+                        epoch,
+                        step + 1,
+                        loss,
+                        batch_acc,
+                        top5_acc,
+                        throughput,
+                        step_duration * 1000.0,
+                        ema_loss_str,
+                        ema_acc_str,
+                        lr,
+                        batch_x.shape[0],
+                    )
+
                     if step % 10 == 0:
                         await asyncio.sleep(0)
 
@@ -784,6 +802,20 @@ class TrainingService:
                 }
                 await self._broker.publish("metrics_epoch", epoch_payload)
 
+                avg_tps_str = f"{avg_throughput:.1f}" if avg_throughput is not None else "nan"
+                logger.info(
+                    "[EPOCH] epoch=%d loss=%.4f acc=%.4f best_acc=%.4f best_loss=%.4f avg_tps=%s epoch_sec=%.1f "
+                    "top5=%.4f",
+                    epoch,
+                    val_loss,
+                    val_acc,
+                    best_acc,
+                    best_loss,
+                    avg_tps_str,
+                    epoch_duration,
+                    val_top5,
+                )
+
                 await self._broker.publish(
                     "log",
                     {
@@ -804,6 +836,7 @@ class TrainingService:
                 "log",
                 {"level": "INFO", "msg": "训练完成", "time_unix": _current_millis()},
             )
+            logger.info("训练完成")
         finally:
             async with self._lock:
                 self._status = "Idle"
@@ -916,8 +949,9 @@ class TrainingService:
         exp = np.exp(logits_stable).astype(np.float32, copy=False)
         probs = exp / np.sum(exp, axis=1, keepdims=True)
         eps = 1e-9
-        loss = float(-np.log(np.clip(probs[np.arange(labels.shape[0]), labels], eps, 1.0)).mean())
-        grad_logits = probs
+        prob_true = probs[np.arange(labels.shape[0]), labels]
+        loss = float(-np.log(np.clip(prob_true, eps, 1.0)).mean())
+        grad_logits = probs.copy()
         grad_logits[np.arange(labels.shape[0]), labels] -= 1.0
         grad_logits /= labels.shape[0]
         return loss, probs, grad_logits

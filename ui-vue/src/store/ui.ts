@@ -26,14 +26,14 @@ const SPIKE_STREAM_TIMEOUT_MS = 1500;
 
 const defaultConfig = (): TrainingConfig => ({
   dataset: 'MNIST',
-  mode: 'tstep',
-  network_size: 1024,
-  layers: 4,
+  mode: 'fpt',
+  network_size: 128,
+  layers: 2,
   lr: 1e-3,
-  K: 10,
-  tol: 1e-4,
-  T: 20,
-  epochs: 3
+  K: 4,
+  tol: 1e-5,
+  T: 12,
+  epochs: 20
 });
 
 const defaultBatchSnapshot = () => ({

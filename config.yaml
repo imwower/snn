@@ -10,3 +10,44 @@ message_queue:
     subject: training.events
     durable: snn-worker
     connect: true
+    timeout: 2.0
+    allow_reconnect: true
+
+training_worker:
+  mode: tstep  # 可设为 tstep 或 fpt
+  data:
+    root: .data/datasets/mnist
+    train: train.npz
+    val: val.npz
+    inputs_key: x
+    labels_key: y
+  network:
+    input_dim: 784
+    hidden_dim: 256
+    output_dim: 10
+  hyperparams:
+    epochs: 10
+    batch_size: 64
+    lr: 0.001
+    weight_decay: 0.0
+    truncation_steps: 4
+    timesteps: 16
+    seed: 42
+  neuron:
+    dt: 0.001
+    tau_soma: 0.02
+    tau_apical: 0.03
+    tau_basal: 0.03
+    coupling_apical: 0.6
+    coupling_basal: 0.6
+    threshold: -0.054
+    v_rest: -0.07
+  nats:
+    servers:
+      - nats://127.0.0.1:4222
+    stream: snn_training
+    timeout: 2.0
+    subjects:
+      metrics: training.metrics
+      spikes: training.spikes
+      logs: training.logs
