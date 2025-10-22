@@ -18,8 +18,9 @@ import urllib.request
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple, Deque
 from urllib.parse import urlparse
+from collections import deque
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, status
@@ -27,9 +28,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .config import get_message_queue_config
+try:  # pragma: no cover - 可选依赖，在测试环境下可能缺失
+    from nats.aio.client import Client as NATSClient
+except Exception:  # pragma: no cover - 未安装 nats-py
+    NATSClient = None  # type: ignore
+
+from .config import get_message_queue_config, load_config
 from .fpt import FixedPointConfig, fixed_point_parallel_solve
-from .mq import InMemoryQueue, MessageQueue, build_message_queue
+from .mq import InMemoryQueue, Message, MessageQueue, build_message_queue
 from .neuron import ThreeCompartmentParams
 
 logger = logging.getLogger(__name__)
@@ -37,6 +43,9 @@ logger = logging.getLogger(__name__)
 
 def _current_millis() -> int:
     return int(time.time() * 1000)
+
+
+HandlerFn = Callable[[Message], Awaitable[None]]
 
 
 class TrainingInitRequest(BaseModel):
@@ -271,6 +280,258 @@ class EventBroker:
             self._subscribers.discard(queue)
 
 
+class LogRingBuffer:
+    """线程安全的环形日志缓冲区。"""
+
+    def __init__(self, capacity: int = 200) -> None:
+        self._buffer: Deque[Dict[str, Any]] = deque(maxlen=capacity)
+        self._lock = asyncio.Lock()
+
+    async def append(self, entry: Dict[str, Any]) -> None:
+        async with self._lock:
+            self._buffer.append(entry)
+
+    async def snapshot(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        async with self._lock:
+            data = list(self._buffer)
+        if limit is None or limit >= len(data):
+            return data
+        return data[-limit:]
+
+
+class ExternalQueueRelay:
+    """从外部消息源消费指标/脉冲/日志并写入 SSE。"""
+
+    def __init__(
+        self,
+        queue: MessageQueue,
+        broker: EventBroker,
+        log_buffer: LogRingBuffer,
+        nats_settings: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._queue = queue
+        self._broker = broker
+        self._log_buffer = log_buffer
+        self._stop_event = asyncio.Event()
+        self._tasks: List[asyncio.Task[None]] = []
+        self._nats_settings = nats_settings or {}
+        self._nc: Optional[NATSClient] = None
+        self._subscriptions: List[int] = []
+
+    async def start(self) -> None:
+        self._stop_event.clear()
+        started = False
+        if NATSClient is not None and self._nats_settings:
+            try:
+                await self._start_nats()
+                started = True
+            except Exception as exc:  # pragma: no cover - 网络或鉴权异常
+                logger.warning("初始化 NATS 订阅失败：%s", exc)
+        if isinstance(self._queue, InMemoryQueue) and not self._tasks:
+            self._tasks = [
+                asyncio.create_task(self._poll_metrics(), name="mq-relay-metrics"),
+                asyncio.create_task(self._poll_spikes(), name="mq-relay-spikes"),
+                asyncio.create_task(self._poll_logs(), name="mq-relay-logs"),
+            ]
+            started = True
+        if not started:
+            logger.info("外部事件订阅未启用（缺少 NATS 配置或使用非内存队列）")
+
+    async def stop(self) -> None:
+        self._stop_event.set()
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._tasks.clear()
+        if self._nc is not None:
+            with contextlib.suppress(Exception):  # pragma: no cover - 关闭连接容错
+                await self._nc.drain()
+            self._nc = None
+            self._subscriptions = []
+
+    async def _start_nats(self) -> None:
+        if NATSClient is None:  # pragma: no cover - 防御性检查
+            raise RuntimeError("nats-py 未安装，无法建立订阅")
+        options = self._build_nats_options()
+        if not options.get("servers"):
+            options["servers"] = ["nats://127.0.0.1:4222"]
+        self._nc = NATSClient()
+        await self._nc.connect(**options)
+        subscriptions = [
+            await self._nc.subscribe("snn.metrics.training", cb=self._on_metrics),
+            await self._nc.subscribe("snn.spikes.layer.*", cb=self._on_spikes),
+            await self._nc.subscribe("snn.ui.log.training", cb=self._on_logs),
+        ]
+        resolved_subs: List[int] = []
+        for sub in subscriptions:
+            sid = getattr(sub, "sid", None)
+            if sid is None:
+                sid = getattr(sub, "id", None)
+            if isinstance(sid, int):
+                resolved_subs.append(sid)
+        self._subscriptions = resolved_subs
+        logger.info("已连接 NATS 并订阅训练事件：metrics/spikes/logs")
+
+    def _build_nats_options(self) -> Dict[str, Any]:
+        servers_raw = self._nats_settings.get("servers")
+        servers: List[str] = []
+        if isinstance(servers_raw, str):
+            servers = [servers_raw]
+        elif isinstance(servers_raw, Iterable):
+            servers = [str(item) for item in servers_raw]
+        timeout = self._nats_settings.get("timeout")
+        allow_reconnect = self._nats_settings.get("allow_reconnect")
+        max_reconnect_attempts = self._nats_settings.get("max_reconnect_attempts")
+        options: Dict[str, Any] = {"servers": servers}
+        if isinstance(timeout, (int, float)):
+            options["connect_timeout"] = float(timeout)
+        if allow_reconnect is not None:
+            options["allow_reconnect"] = bool(allow_reconnect)
+        if isinstance(max_reconnect_attempts, int):
+            options["max_reconnect_attempts"] = max(1, max_reconnect_attempts)
+        return options
+
+    async def _on_metrics(self, msg: Any) -> None:
+        await self._handle_metrics(self._to_message(msg))
+
+    async def _on_spikes(self, msg: Any) -> None:
+        await self._handle_spikes(self._to_message(msg))
+
+    async def _on_logs(self, msg: Any) -> None:
+        await self._handle_logs(self._to_message(msg))
+
+    @staticmethod
+    def _to_message(msg: Any) -> Message:
+        headers_raw = getattr(msg, "headers", None)
+        headers = dict(headers_raw) if headers_raw else {}
+        data = msg.data if isinstance(msg.data, bytes) else bytes(msg.data)
+        return Message(subject=getattr(msg, "subject", ""), data=data, headers=headers)
+
+    async def _poll_metrics(self) -> None:
+        await self._poll_subject("snn.metrics.training", self._handle_metrics)
+
+    async def _poll_spikes(self) -> None:
+        await self._poll_subject("snn.spikes.layer.*", self._handle_spikes)
+
+    async def _poll_logs(self) -> None:
+        await self._poll_subject("snn.ui.log.training", self._handle_logs)
+
+    async def _poll_subject(
+        self,
+        subject: str,
+        handler: HandlerFn,
+        *,
+        idle_sleep: float = 0.5,
+        batch_size: int = 10,
+    ) -> None:
+        while not self._stop_event.is_set():
+            try:
+                messages = await asyncio.to_thread(self._queue.pull, subject, max_messages=batch_size)
+            except Exception as exc:  # pragma: no cover - 网络或消息队列异常
+                logger.warning("拉取消息失败 subject=%s: %s", subject, exc)
+                await asyncio.sleep(1.0)
+                continue
+            if not messages:
+                await asyncio.sleep(idle_sleep)
+                continue
+            for message in messages:
+                if self._stop_event.is_set():
+                    return
+                try:
+                    await handler(message)
+                except asyncio.CancelledError:  # pragma: no cover - 任务取消
+                    raise
+                except Exception as exc:  # pragma: no cover - 单条消息处理异常
+                    logger.warning("处理消息失败 subject=%s: %s", message.subject, exc)
+
+    async def _handle_metrics(self, message: Message) -> None:
+        payload = self._decode_payload(message)
+        if payload is None:
+            return
+        if "time_unix" not in payload or not isinstance(payload["time_unix"], (int, float)):
+            payload["time_unix"] = _current_millis()
+        phase = payload.get("phase")
+        phase_text = str(phase).lower() if isinstance(phase, str) else ""
+        if phase_text in {"val", "validation"}:
+            payload["phase"] = "val"
+            event_name = "metrics_epoch"
+        else:
+            payload["phase"] = "train"
+            event_name = "metrics_batch"
+        await self._broker.publish(event_name, payload)
+
+    async def _handle_spikes(self, message: Message) -> None:
+        payload = self._decode_payload(message)
+        if payload is None:
+            return
+        layer = payload.get("layer")
+        if not isinstance(layer, int):
+            subject_layer = self._extract_layer_from_subject(message.subject)
+            if subject_layer is not None:
+                payload["layer"] = subject_layer
+        if "time_unix" not in payload or not isinstance(payload["time_unix"], (int, float)):
+            payload["time_unix"] = _current_millis()
+        await self._broker.publish("spike", payload)
+
+    async def _handle_logs(self, message: Message) -> None:
+        payload = self._decode_payload(message)
+        if payload is None:
+            return
+        level_raw = payload.get("level", "INFO")
+        level = str(level_raw).upper()
+        if level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+            level = "INFO"
+        msg_value = payload.get("msg") or payload.get("message") or ""
+        msg_text = str(msg_value)
+        time_unix = payload.get("time_unix")
+        if not isinstance(time_unix, (int, float)):
+            time_unix = _current_millis()
+        metric_payload = payload.get("metric") if isinstance(payload.get("metric"), dict) else None
+        sse_payload: Dict[str, Any] = {
+            "level": level,
+            "msg": msg_text,
+            "time_unix": time_unix,
+        }
+        if metric_payload is not None:
+            sse_payload["metric"] = metric_payload
+        await self._broker.publish("log", sse_payload)
+        log_entry: Dict[str, Any] = {
+            "ts": int(time_unix // 1000),
+            "level": level,
+            "message": msg_text,
+        }
+        if metric_payload is not None:
+            log_entry["metric"] = metric_payload
+        await self._log_buffer.append(log_entry)
+
+    @staticmethod
+    def _extract_layer_from_subject(subject: str) -> Optional[int]:
+        for part in reversed(subject.split(".")):
+            if part.isdigit():
+                return int(part)
+        return None
+
+    def _decode_payload(self, message: Message) -> Optional[Dict[str, Any]]:
+        try:
+            text = message.data.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.warning("无法解码消息主体 subject=%s", message.subject)
+            return None
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            logger.warning("消息 JSON 解析失败 subject=%s", message.subject)
+            return None
+        if isinstance(decoded, dict):
+            if "payload" in decoded and isinstance(decoded["payload"], dict):
+                return decoded["payload"]
+            return decoded
+        logger.debug("忽略非对象消息 subject=%s", message.subject)
+        return None
+
+
 class DatasetService:
     """数据集下载与列表管理。"""
 
@@ -433,6 +694,14 @@ class DatasetService:
             raise
 
         self._write_metadata(dataset_dir, record.name, downloaded)
+        placeholder = dataset_dir / "sample.txt"
+        try:
+            placeholder.write_text(
+                "Dataset placeholder generated by DatasetService.\n", encoding="utf-8"
+            )
+        except OSError:
+            logger.warning("无法写入占位符文件 %s", placeholder)
+
         record.installed = True
         record.message = None
         record.progress = 1.0
@@ -521,14 +790,28 @@ class TrainingService:
     def get_config(self) -> Dict[str, Any]:
         return dict(self._config)
 
-    async def _emit_log(self, level: str, message: str) -> None:
+    async def _emit_log(
+        self,
+        level: str,
+        message: str,
+        *,
+        metric: Optional[Dict[str, Any]] = None,
+        subject: Optional[str] = None,
+    ) -> None:
         level_upper = level.upper()
         log_level = getattr(logging, level_upper, logging.INFO)
         logger.log(log_level, message)
-        await self._broker.publish(
-            "log",
-            {"level": level_upper, "msg": message, "time_unix": _current_millis()},
-        )
+        payload: Dict[str, Any] = {"level": level_upper, "msg": message, "time_unix": _current_millis()}
+        if metric is not None:
+            payload["metric"] = metric
+        await self._broker.publish("log", payload)
+        if subject:
+            queue = getattr(self._broker, "_message_queue", None)
+            if queue is not None:
+                try:
+                    queue.publish(subject, json.dumps(payload, ensure_ascii=True).encode("utf-8"))
+                except Exception as exc:  # pragma: no cover - 外部队列可能未配置
+                    logger.debug("发布训练日志到 %s 失败：%s", subject, exc)
 
     async def init_training(self, payload: TrainingInitRequest) -> None:
         async with self._lock:
@@ -595,6 +878,8 @@ class TrainingService:
     async def _run_training(self) -> None:
         config = self.get_config()
         dataset_name = config.get("dataset", "MNIST")
+        mode_text = str(config.get("mode", "fpt")).lower()
+        use_residual_metric = mode_text == "fpt"
         np_rng = np.random.default_rng(self._np_seed)
         logger.info("加载数据集：%s", dataset_name)
         try:
@@ -661,6 +946,10 @@ class TrainingService:
                 epoch_start = time.perf_counter()
                 indices = np_rng.permutation(total_examples)
                 batch_throughputs: List[float] = []
+                epoch_loss_total = 0.0
+                epoch_acc_total = 0.0
+                epoch_examples = 0
+                epoch_residuals: List[float] = []
                 await self._emit_log(
                     "INFO",
                     (
@@ -686,13 +975,35 @@ class TrainingService:
                     batch_x = train_x[batch_idx]
                     batch_y = train_y[batch_idx]
 
+                    batch_size_actual = batch_x.shape[0]
+                    if batch_y.dtype != np.int64:
+                        raise AssertionError(f"batch labels must be int64, got {batch_y.dtype}")
+                    if batch_y.size > 0:
+                        y_min = int(batch_y.min())
+                        y_max = int(batch_y.max())
+                        if y_min < 0 or y_max >= num_classes:
+                            raise AssertionError(
+                                f"batch labels must be within [0, {num_classes}), got [{y_min}, {y_max}]"
+                            )
+
                     step_start = time.perf_counter()
                     logits, basal_currents = self._forward_batch(model, batch_x, kernel)
+                    if logits.shape[1] != num_classes:
+                        raise AssertionError(
+                            f"logits second dimension must equal num_classes={num_classes}, got {logits.shape[1]}"
+                        )
                     loss, probs, grad_logits = self._cross_entropy(logits, batch_y)
                     predictions = np.argmax(probs, axis=1)
+                    if predictions.shape != batch_y.shape:
+                        raise AssertionError("np.argmax must operate along axis=1")
                     batch_acc = float(np.mean(predictions == batch_y))
                     top5_hits = np.any(np.argsort(probs, axis=1)[:, -5:] == batch_y[:, None], axis=1)
                     top5_acc = float(np.mean(top5_hits))
+
+                    if batch_size_actual > 0:
+                        epoch_loss_total += loss * batch_size_actual
+                        epoch_acc_total += batch_acc * batch_size_actual
+                        epoch_examples += batch_size_actual
 
                     grads = self._compute_gradients(batch_x, grad_logits, kernel)
                     if batch_acc == 0.0 and zero_acc_logs < 3:
@@ -733,6 +1044,9 @@ class TrainingService:
                         timesteps,
                         fp_config,
                     )
+
+                    if use_residual_metric and batch_size_actual > 0:
+                        epoch_residuals.append(residual_value)
 
                     metrics_payload = {
                         "epoch": epoch,
@@ -783,11 +1097,18 @@ class TrainingService:
                     if step % 10 == 0:
                         await asyncio.sleep(0)
 
-                val_loss, val_acc, val_top5 = self._evaluate(model, dataset.val_x, dataset.val_y, kernel, batch_size=512)
+                val_loss, val_acc, val_top5 = self._evaluate(
+                    model, dataset.val_x, dataset.val_y, kernel, batch_size=512
+                )
                 best_acc = max(best_acc, val_acc)
                 best_loss = min(best_loss, val_loss)
                 epoch_duration = time.perf_counter() - epoch_start
                 avg_throughput = float(np.mean(batch_throughputs)) if batch_throughputs else None
+                train_loss_epoch = epoch_loss_total / max(epoch_examples, 1)
+                train_acc_epoch = epoch_acc_total / max(epoch_examples, 1)
+                residual_mean = (
+                    float(np.mean(epoch_residuals)) if use_residual_metric and epoch_residuals else None
+                )
 
                 epoch_payload = {
                     "epoch": epoch,
@@ -799,14 +1120,21 @@ class TrainingService:
                     "epoch_sec": epoch_duration,
                     "top5": val_top5,
                     "time_unix": _current_millis(),
+                    "train_loss": train_loss_epoch,
+                    "train_acc": train_acc_epoch,
                 }
+                if residual_mean is not None:
+                    epoch_payload["residual"] = residual_mean
                 await self._broker.publish("metrics_epoch", epoch_payload)
 
                 avg_tps_str = f"{avg_throughput:.1f}" if avg_throughput is not None else "nan"
+                residual_str = f"{residual_mean:.6f}" if residual_mean is not None else "n/a"
                 logger.info(
-                    "[EPOCH] epoch=%d loss=%.4f acc=%.4f best_acc=%.4f best_loss=%.4f avg_tps=%s epoch_sec=%.1f "
-                    "top5=%.4f",
+                    "[EPOCH] epoch=%d train_loss=%.4f train_acc=%.4f val_loss=%.4f val_acc=%.4f best_acc=%.4f "
+                    "best_loss=%.4f avg_tps=%s epoch_sec=%.1f top5=%.4f residual=%s",
                     epoch,
+                    train_loss_epoch,
+                    train_acc_epoch,
                     val_loss,
                     val_acc,
                     best_acc,
@@ -814,19 +1142,31 @@ class TrainingService:
                     avg_tps_str,
                     epoch_duration,
                     val_top5,
+                    residual_str,
                 )
 
-                await self._broker.publish(
-                    "log",
-                    {
-                        "level": "INFO",
-                        "msg": (
-                            f"[EPOCH {epoch}/{epochs}] loss={loss:.4f} "
-                            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
-                        ),
-                        "time_unix": _current_millis(),
-                    },
+                log_metric: Dict[str, Any] = {
+                    "train_loss": train_loss_epoch,
+                    "train_acc": train_acc_epoch,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                }
+                if avg_throughput is not None:
+                    log_metric["avg_throughput"] = avg_throughput
+                if residual_mean is not None:
+                    log_metric["residual"] = residual_mean
+                log_message = (
+                    f"[epoch {epoch}/{epochs}] "
+                    f"train_loss={train_loss_epoch:.4f} train_acc={train_acc_epoch:.4f} "
+                    f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
                 )
+                log_message += (
+                    f" residual={residual_mean:.6f}" if residual_mean is not None else " residual=n/a"
+                )
+                log_message += (
+                    f" avg_throughput={avg_throughput:.2f}" if avg_throughput is not None else " avg_throughput=n/a"
+                )
+                await self._emit_log("INFO", log_message, metric=log_metric, subject="snn.ui.log.training")
 
                 if self._stop_event.is_set():
                     await self._broker.publish("train_status", {"status": "Stopped", "time_unix": _current_millis()})
@@ -1073,12 +1413,23 @@ def create_app(message_queue_config: Optional[Dict[str, Any]] = None) -> FastAPI
     broker, queue = _build_broker(mq_config)
     dataset_service = DatasetService(broker)
     training_service = TrainingService(broker)
+    log_buffer = LogRingBuffer(capacity=200)
+    global_config = load_config()
+    worker_nats_cfg = {}
+    training_worker_cfg = global_config.get("training_worker") if isinstance(global_config, dict) else {}
+    if isinstance(training_worker_cfg, dict):
+        nats_cfg = training_worker_cfg.get("nats")
+        if isinstance(nats_cfg, dict):
+            worker_nats_cfg = nats_cfg
+    relay = ExternalQueueRelay(queue, broker, log_buffer, worker_nats_cfg)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        await relay.start()
         try:
             yield
         finally:
+            await relay.stop()
             if isinstance(queue, InMemoryQueue):
                 queue.close()
 
@@ -1096,6 +1447,8 @@ def create_app(message_queue_config: Optional[Dict[str, Any]] = None) -> FastAPI
     app.state.broker = broker
     app.state.dataset_service = dataset_service
     app.state.training_service = training_service
+    app.state.log_buffer = log_buffer
+    app.state.queue_relay = relay
 
     @app.get("/api/config")
     async def get_config() -> Dict[str, Any]:
@@ -1125,6 +1478,12 @@ def create_app(message_queue_config: Optional[Dict[str, Any]] = None) -> FastAPI
     async def stop_training() -> JSONResponse:
         await training_service.stop_training()
         return JSONResponse({"ok": True})
+
+    @app.get("/api/logs/recent")
+    async def recent_logs(limit: int = 200) -> Dict[str, Any]:
+        clamp = max(1, min(limit, 500))
+        entries = await log_buffer.snapshot(clamp)
+        return {"logs": entries}
 
     @app.get("/events")
     async def events() -> StreamingResponse:

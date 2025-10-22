@@ -1,0 +1,11 @@
+{
+  "name": "MNIST",
+  "downloaded_at": 1761145889.254642,
+  "files": [
+    {
+      "filename": "mnist.npz",
+      "url": "https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz",
+      "size_bytes": 11490434
+    }
+  ]
+}

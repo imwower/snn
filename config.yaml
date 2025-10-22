@@ -48,6 +48,6 @@ training_worker:
     stream: snn_training
     timeout: 2.0
     subjects:
-      metrics: training.metrics
-      spikes: training.spikes
-      logs: training.logs
+      metrics: snn.metrics.training
+      spikes: snn.spikes.layer
+      logs: snn.ui.log.training

@@ -254,6 +254,24 @@ const fetchConfig = async () => {
   }
 };
 
+const fetchRecentLogs = async () => {
+  const store = storeInstance;
+  if (!store) {
+    return;
+  }
+  try {
+    const response = await fetch('/api/logs/recent?limit=200', { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`status=${response.status}`);
+    }
+    const payload = await response.json();
+    const logs = Array.isArray(payload?.logs) ? (payload.logs as LogPayload[]) : [];
+    store.replaceLogs(logs);
+  } catch (err) {
+    console.warn('获取历史日志失败', err);
+  }
+};
+
 const connect = () => {
   if (!storeInstance) {
     return;
@@ -272,6 +290,7 @@ export const startSocket = (pinia: Pinia) => {
   }
   storeInstance = useUiStore(pinia);
   started = true;
+  void fetchRecentLogs();
   void fetchConfig();
   connect();
 };
