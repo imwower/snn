@@ -16,11 +16,19 @@ logger = logging.getLogger(__name__)
 try:  # pragma: no cover - 可选依赖，测试环境可能缺失
     from nats.aio.client import Client as NATS  # type: ignore
     from nats.errors import Error as NatsError  # type: ignore
+    from nats.errors import NoRespondersError  # type: ignore
+    from nats.js.errors import (
+        NoStreamResponseError as JetStreamNoStreamResponseError,  # type: ignore
+        ServiceUnavailableError as JetStreamServiceUnavailableError,  # type: ignore
+    )
 
     NATS_AVAILABLE = True
 except Exception:  # pragma: no cover - 未安装 nats-py
     NATS = None  # type: ignore
     NatsError = Exception  # type: ignore
+    NoRespondersError = Exception  # type: ignore
+    JetStreamServiceUnavailableError = Exception  # type: ignore
+    JetStreamNoStreamResponseError = Exception  # type: ignore
     NATS_AVAILABLE = False
 
 
@@ -107,6 +115,7 @@ class NatsJetStreamQueue(MessageQueue):
             raise ValueError("需要至少配置一个 NATS 服务器地址")
         self._stream = stream
         self._subject = subject
+        self._subjects = self._compute_subjects(subject)
         self._durable = durable
         self._request_timeout = request_timeout
         self._allow_reconnect = allow_reconnect
@@ -137,7 +146,7 @@ class NatsJetStreamQueue(MessageQueue):
             )
             self._jetstream = self._nats.jetstream()
             try:
-                await self._jetstream.add_stream(name=self._stream, subjects=[self._subject])
+                await self._jetstream.add_stream(name=self._stream, subjects=self._subjects)
             except NatsError:
                 pass
             self._connected = True
@@ -149,12 +158,55 @@ class NatsJetStreamQueue(MessageQueue):
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         future.result(timeout=self._request_timeout)
 
+    @staticmethod
+    def _compute_subjects(subject: str) -> List[str]:
+        subjects = [subject]
+        if "*" not in subject and ">" not in subject:
+            subjects.append(f"{subject}.>")
+        return list(dict.fromkeys(subjects))
+
+    def _should_recover_stream(self, exc: Exception) -> bool:
+        if isinstance(exc, JetStreamServiceUnavailableError):
+            message = str(exc).lower()
+            return "error opening msg block file" in message
+        if isinstance(exc, (JetStreamNoStreamResponseError, NoRespondersError)):
+            return True
+        return False
+
+    async def _recreate_stream(self) -> None:
+        assert self._jetstream is not None
+        try:
+            subjects = self._subjects
+            try:
+                info = await self._jetstream.stream_info(self._stream)  # type: ignore[attr-defined]
+                configured = getattr(getattr(info, "config", None), "subjects", None)
+                if configured:
+                    subjects = list(configured)
+            except Exception:
+                subjects = self._subjects
+            await self._jetstream.delete_stream(self._stream)
+        except Exception as exc:  # pragma: no cover - 仅记录日志
+            logger.warning("删除 JetStream 流 %s 失败：%s", self._stream, exc)
+            subjects = self._subjects
+        await self._jetstream.add_stream(name=self._stream, subjects=subjects)
+        logger.warning("JetStream 流 %s 已重建，主题 %s", self._stream, self._subject)
+
     def publish(self, subject: str, data: bytes, *, headers: Optional[Dict[str, str]] = None) -> None:
         self._ensure_connected()
         assert self._jetstream is not None
 
         async def _publish() -> None:
-            await self._jetstream.publish(subject, payload=data, headers=headers or {})
+            attempts = 0
+            while True:
+                try:
+                    await self._jetstream.publish(subject, payload=data, headers=headers or {})
+                    return
+                except Exception as exc:
+                    attempts += 1
+                    if attempts > 1 or not self._should_recover_stream(exc):
+                        raise
+                    logger.warning("检测到 JetStream 存储异常，尝试重建流 %s：%s", self._stream, exc)
+                    await self._recreate_stream()
 
         self._submit(_publish())
 
@@ -163,17 +215,26 @@ class NatsJetStreamQueue(MessageQueue):
         assert self._jetstream is not None
 
         async def _pull() -> List[Message]:
-            consumer = await self._jetstream.pull_subscribe(
-                subject=subject,
-                durable=self._durable or f"{self._stream}_worker",
-                stream=self._stream,
-            )
-            msgs = await consumer.fetch(batch=max_messages, timeout=self._request_timeout)
-            result: List[Message] = []
-            for msg in msgs:
-                result.append(Message(subject=msg.subject, data=bytes(msg.data), headers=dict(msg.headers or {})))
-                await msg.ack()
-            return result
+            attempts = 0
+            while True:
+                try:
+                    consumer = await self._jetstream.pull_subscribe(
+                        subject=subject,
+                        durable=self._durable or f"{self._stream}_worker",
+                        stream=self._stream,
+                    )
+                    msgs = await consumer.fetch(batch=max_messages, timeout=self._request_timeout)
+                    result: List[Message] = []
+                    for msg in msgs:
+                        result.append(Message(subject=msg.subject, data=bytes(msg.data), headers=dict(msg.headers or {})))
+                        await msg.ack()
+                    return result
+                except Exception as exc:
+                    attempts += 1
+                    if attempts > 1 or not self._should_recover_stream(exc):
+                        raise
+                    logger.warning("拉取 JetStream 消息时检测到存储异常，尝试重建流 %s：%s", self._stream, exc)
+                    await self._recreate_stream()
 
         future = asyncio.run_coroutine_threadsafe(_pull(), self._loop)
         return future.result(timeout=self._request_timeout)
@@ -242,4 +303,7 @@ __all__ = [
     "InMemoryQueue",
     "NatsJetStreamQueue",
     "build_message_queue",
+    "JetStreamServiceUnavailableError",
+    "JetStreamNoStreamResponseError",
+    "NoRespondersError",
 ]
