@@ -132,3 +132,41 @@ training_service:
   head_hidden: 64
   head_momentum: 0.9
   unfreeze_at_conf: 0.13
+
+train:
+  augment: true
+  head_hidden: 256
+  logit_scale_init: 1.25
+  logit_scale_min: 0.5
+  logit_scale_max: 3.0
+  unfreeze_at_conf: 0.13
+  optimizer:
+    type: adamw
+    head_lr: 0.003
+    rec_lr: 0.001
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 1.0e-4
+    grad_clip: 1.0
+  scheduler:
+    type: warmup_cosine
+    warmup_ratio: 0.05
+    min_lr_ratio: 0.1
+    restarts: []
+  solver: anderson
+  anderson_m: 4
+  anderson_beta: 0.5
+  K_schedule: [2, 3, 4]
+  tol: 1.0e-5
+  lambda_contr: 1.0e-4
+  rho_max: 0.9
+  rate_reg_lambda: 1.0e-3
+  rate_target: 0.20
+  g_apical_start: 0.5
+  g_apical_end: 0.2
+  beta_start: 5.0
+  beta_end: 6.0
+  vth_start: 0.50
+  vth_end: 0.55
+  ema_decay: 0.999
+  label_smoothing: 0.00
