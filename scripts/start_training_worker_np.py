@@ -22,16 +22,16 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import yaml
 from nats.aio.client import Client as NATS
 from nats.errors import Error as NatsError
 
-from snn.models import ReadoutMLP
-
 from snn.data import DATASET_IMAGE_SHAPES, ensure_feature_stats, standardize_batch
+from snn.models import ReadoutMLP
+from snn.optim import AdamWOptimizer, WarmupCosineScheduler
 
 
 LOGGER = logging.getLogger("training_worker_np")
@@ -80,6 +80,11 @@ class HyperParams:
     logit_scale_min: float = 0.5
     logit_scale_max: float = 3.0
     logit_scale_learnable: bool = True
+    optimizer_head_lr: float = 3e-3
+    optimizer_rec_lr: float = 1e-3
+    optimizer_betas: Tuple[float, float] = (0.9, 0.999)
+    optimizer_eps: float = 1e-8
+    optimizer_weight_decay: float = 0.0
     rate_reg_lambda: float = 1e-3
     rate_target: float = 0.2
     g_apical_start: float = 0.5
@@ -95,6 +100,7 @@ class HyperParams:
     head_hidden: int = 64
     head_momentum: float = 0.9
     unfreeze_at_conf: float = 0.13
+    scheduler_restarts: Optional[Tuple[int, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -251,6 +257,65 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
     head_hidden_value = int(max(4, hyper_raw.get("head_hidden", 64)))
     head_momentum_value = float(np.clip(hyper_raw.get("head_momentum", 0.9), 0.0, 0.999))
     unfreeze_at_conf_value = float(hyper_raw.get("unfreeze_at_conf", 0.13))
+
+    optimizer_block = hyper_raw.get("optimizer")
+    if not isinstance(optimizer_block, dict):
+        optimizer_block = {}
+    optimizer_override = train_overrides.get("optimizer") if train_overrides else None
+    if not isinstance(optimizer_override, dict):
+        optimizer_override = {}
+
+    def _opt_value(key: str, default: Any) -> Any:
+        if key in optimizer_override:
+            return optimizer_override[key]
+        return optimizer_block.get(key, default)
+
+    head_lr_value = float(_opt_value("head_lr", 3e-3))
+    rec_lr_value = float(_opt_value("rec_lr", 1e-3))
+    betas_raw = _opt_value("betas", (0.9, 0.999))
+    if isinstance(betas_raw, Sequence):
+        beta1 = float(betas_raw[0])
+        beta2 = float(betas_raw[1] if len(betas_raw) > 1 else betas_raw[0])
+    else:
+        beta1, beta2 = 0.9, 0.999
+    eps_value = float(_opt_value("eps", 1e-8))
+    opt_weight_decay = float(_opt_value("weight_decay", hyper_raw.get("weight_decay", 0.0)))
+
+    scheduler_block = hyper_raw.get("scheduler")
+    if not isinstance(scheduler_block, dict):
+        scheduler_block = {}
+    scheduler_override = train_overrides.get("scheduler") if train_overrides else None
+    if isinstance(scheduler_override, dict):
+        merged_scheduler = {**scheduler_block, **scheduler_override}
+    else:
+        merged_scheduler = scheduler_block
+
+    def _parse_restarts(raw: Any) -> Optional[Tuple[int, ...]]:
+        if raw is None:
+            return None
+        values: List[int] = []
+        if isinstance(raw, str):
+            for token in raw.replace(";", ",").split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    value = int(token)
+                except ValueError:
+                    continue
+                if value > 0:
+                    values.append(value)
+        elif isinstance(raw, Sequence):
+            for entry in raw:
+                try:
+                    value = int(entry)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    values.append(value)
+        return tuple(values) if values else None
+
+    scheduler_restarts_value = _parse_restarts(merged_scheduler.get("restarts"))
     rate_lambda = float(hyper_raw.get("rate_reg_lambda", 1e-3))
     rate_target = float(hyper_raw.get("rate_target", 0.2))
     reg_block = hyper_raw.get("tstep_regularization")
@@ -325,6 +390,11 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         logit_scale_min=max(1e-9, logit_scale_min_value),
         logit_scale_max=max(logit_scale_max_value, logit_scale_min_value + 1e-5),
         logit_scale_learnable=logit_scale_learnable,
+        optimizer_head_lr=max(1e-9, head_lr_value),
+        optimizer_rec_lr=max(1e-9, rec_lr_value),
+        optimizer_betas=(beta1, beta2),
+        optimizer_eps=max(1e-12, eps_value),
+        optimizer_weight_decay=max(0.0, opt_weight_decay),
         rate_reg_lambda=max(0.0, rate_lambda),
         rate_target=rate_target,
         g_apical_start=g_apical_start,
@@ -340,6 +410,7 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         head_hidden=head_hidden_value,
         head_momentum=head_momentum_value,
         unfreeze_at_conf=max(0.0, unfreeze_at_conf_value),
+        scheduler_restarts=scheduler_restarts_value,
     )
 
     nats_raw = worker_raw.get("nats", {})
@@ -381,17 +452,6 @@ def current_millis() -> int:
     return int(time.time() * 1000)
 
 
-def _cosine_decay(step: int, base_lr: float, warmup_steps: int, total_steps: int) -> float:
-    if total_steps <= 0:
-        return base_lr
-    step = max(0, step)
-    if warmup_steps > 0 and step < warmup_steps:
-        return base_lr * float(step) / float(max(1, warmup_steps))
-    progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-    progress = min(max(progress, 0.0), 1.0)
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-
 def _clip_gradient_norm(grads: Iterable[np.ndarray], max_norm: Optional[float]) -> None:
     if max_norm is None or max_norm <= 0:
         return
@@ -410,13 +470,6 @@ def _clip_gradient_norm(grads: Iterable[np.ndarray], max_norm: Optional[float]) 
         if grad is None:
             continue
         grad *= scale
-
-
-def _apply_decoupled_weight_decay(param: np.ndarray, lr: float, weight_decay: float) -> None:
-    if weight_decay <= 0.0 or lr <= 0.0:
-        return
-    factor = max(0.0, 1.0 - lr * weight_decay)
-    param *= factor
 
 
 def log_softmax(logits: np.ndarray) -> np.ndarray:
@@ -918,13 +971,16 @@ class TrainStepResult:
     s_rate: Optional[float] = None
     logit_mean: Optional[float] = None
     logit_std: Optional[float] = None
+    grad_norm: Optional[float] = None
+    delta_norm: Optional[float] = None
+    lr_head: Optional[float] = None
+    lr_rec: Optional[float] = None
 
 
 class Trainer:
     def __init__(self, config: WorkerConfig, model: ThreeCompartmentModel) -> None:
         self.cfg = config
         self.model = model
-        self.weight_decay = max(0.0, self.cfg.hyper.weight_decay)
         self.grad_clip = self.cfg.hyper.grad_clip if (self.cfg.hyper.grad_clip and self.cfg.hyper.grad_clip > 0) else None
         self.learnable_temperature = self.cfg.hyper.learnable_temperature
         self._temperature = max(1e-6, self.cfg.hyper.temperature)
@@ -961,6 +1017,41 @@ class Trainer:
         self.fp_tolerance = max(1e-9, float(self.cfg.hyper.fp_tolerance))
         self._active_truncation = max(1, self.cfg.hyper.truncation_steps)
         self._k_schedule_mode, self._k_schedule_values = self._parse_k_schedule(self.K_schedule)
+        if self.logit_scale_learnable:
+            self._logit_scale_param = np.array([self.logit_scale], dtype=np.float32)
+        else:
+            self._logit_scale_param = None
+        if self.learnable_temperature:
+            self._temperature_param = np.array([self._temperature], dtype=np.float32)
+        else:
+            self._temperature_param = None
+        head_params: List[np.ndarray] = [
+            self.model.head.W1,
+            self.model.head.b1,
+            self.model.head.W2,
+            self.model.head.b2,
+        ]
+        if self._logit_scale_param is not None:
+            head_params.append(self._logit_scale_param)
+        if self._temperature_param is not None:
+            head_params.append(self._temperature_param)
+        rec_params = [self.model.Wxh, self.model.Whh, self.model.bh]
+        self._head_param_count = len(head_params)
+        self._rec_param_count = len(rec_params)
+        self.optimizer = AdamWOptimizer(
+            [
+                {
+                    "params": head_params,
+                    "weight_decay": self.cfg.hyper.optimizer_weight_decay,
+                },
+                {
+                    "params": rec_params,
+                    "weight_decay": self.cfg.hyper.optimizer_weight_decay,
+                },
+            ],
+            betas=self.cfg.hyper.optimizer_betas,
+            eps=self.cfg.hyper.optimizer_eps,
+        )
 
     @property
     def temperature(self) -> float:
@@ -1090,6 +1181,38 @@ class Trainer:
             raise AssertionError("probabilities outside [0,1] or non-finite")
         return logit_mean, logit_std
 
+    def _apply_optimizer(
+        self,
+        head_grads: List[Optional[np.ndarray]],
+        rec_grads: List[Optional[np.ndarray]],
+        *,
+        head_lr: float,
+        rec_lr: float,
+    ) -> Tuple[float, float]:
+        grads_all = [grad for grad in head_grads + rec_grads if grad is not None]
+        grad_norm = 0.0
+        if grads_all:
+            grad_norm = math.sqrt(sum(float(np.sum(grad.astype(np.float64) ** 2)) for grad in grads_all))
+        raw_grad_norm = grad_norm
+        if self.grad_clip and grad_norm > self.grad_clip and grad_norm > 0.0:
+            scale = self.grad_clip / (grad_norm + 1e-12)
+            for grad in head_grads + rec_grads:
+                if grad is not None:
+                    grad *= scale
+        delta_norm = self.optimizer.step(
+            [head_grads, rec_grads],
+            [head_lr, rec_lr],
+        )
+        if self._logit_scale_param is not None:
+            self.logit_scale = float(np.clip(self._logit_scale_param[0], self.logit_scale_min, self.logit_scale_max))
+            self._logit_scale_param[0] = self.logit_scale
+        else:
+            self.logit_scale = float(np.clip(self.logit_scale, self.logit_scale_min, self.logit_scale_max))
+        if self._temperature_param is not None:
+            self._temperature_param[0] = max(1e-6, self._temperature_param[0])
+            self._temperature = float(self._temperature_param[0])
+        return raw_grad_norm, delta_norm
+
     def _estimate_spectral_norm(self, matrix: np.ndarray, iterations: int = 6) -> float:
         if matrix.size == 0:
             return 0.0
@@ -1131,7 +1254,8 @@ class Trainer:
         self,
         batch_x: np.ndarray,
         batch_y: np.ndarray,
-        lr: float,
+        head_lr: float,
+        rec_lr: float,
         apical_coupling: Optional[float] = None,
         beta_override: Optional[float] = None,
         threshold_override: Optional[float] = None,
@@ -1190,28 +1314,31 @@ class Trainer:
         grad_head_logits = grad_logits_scaled * scale_factor
         _, head_grads = self.model.head.backward(grad_head_logits, head_cache)
         common_term = float(np.sum(grad_logits_scaled * head_outputs))
+        logit_scale_grad_arr: Optional[np.ndarray] = None
+        if self._logit_scale_param is not None:
+            logit_scale_grad = common_term / temp_value
+            logit_scale_grad_arr = np.array([logit_scale_grad], dtype=np.float32)
         temp_grad_arr: Optional[np.ndarray] = None
-        if self.learnable_temperature:
+        if self._temperature_param is not None:
             temp_grad = -common_term * self.logit_scale / (temp_value ** 2)
-            temp_grad_arr = np.array([temp_grad], dtype=np.float64)
-        grads_to_clip = [
+            temp_grad_arr = np.array([temp_grad], dtype=np.float32)
+        head_grad_list: List[Optional[np.ndarray]] = [
             head_grads["W1"],
             head_grads["b1"],
             head_grads["W2"],
             head_grads["b2"],
         ]
-        if temp_grad_arr is not None:
-            grads_to_clip.append(temp_grad_arr)
-        _clip_gradient_norm(grads_to_clip, self.grad_clip)
-        self.model.head.apply_gradients(head_grads, lr, weight_decay=self.weight_decay)
-        if self.logit_scale_learnable:
-            logit_scale_grad = common_term / temp_value
-            updated_scale = self.logit_scale - lr * logit_scale_grad
-            self.logit_scale = float(np.clip(updated_scale, self.logit_scale_min, self.logit_scale_max))
-        else:
-            self.logit_scale = float(np.clip(self.logit_scale, self.logit_scale_min, self.logit_scale_max))
-        if temp_grad_arr is not None:
-            self._temperature = max(1e-6, self._temperature - lr * float(temp_grad_arr[0]))
+        if self._logit_scale_param is not None:
+            head_grad_list.append(logit_scale_grad_arr)
+        if self._temperature_param is not None:
+            head_grad_list.append(temp_grad_arr)
+        rec_grad_list: List[Optional[np.ndarray]] = [None] * self._rec_param_count
+        grad_norm, delta_norm = self._apply_optimizer(
+            head_grad_list,
+            rec_grad_list,
+            head_lr=head_lr,
+            rec_lr=rec_lr,
+        )
 
         total_spikes, per_neuron = _aggregate_spikes(spikes)
         return TrainStepResult(
@@ -1226,13 +1353,18 @@ class Trainer:
             s_rate=s_rate,
             logit_mean=logit_mean,
             logit_std=logit_std,
+            grad_norm=grad_norm,
+            delta_norm=delta_norm,
+            lr_head=head_lr,
+            lr_rec=rec_lr,
         )
 
     def _train_step_fpt(
         self,
         batch_x: np.ndarray,
         batch_y: np.ndarray,
-        lr: float,
+        head_lr: float,
+        rec_lr: float,
         apical_coupling: Optional[float] = None,
         beta_override: Optional[float] = None,
         threshold_override: Optional[float] = None,
@@ -1284,10 +1416,24 @@ class Trainer:
         grad_head_logits = grad_logits_scaled * scale_factor
         grad_head_inputs, head_grads = self.model.head.backward(grad_head_logits, head_cache)
         common_term = float(np.sum(grad_logits_scaled * head_outputs))
+        logit_scale_grad_arr: Optional[np.ndarray] = None
+        if self._logit_scale_param is not None:
+            logit_scale_grad = common_term / temp_value
+            logit_scale_grad_arr = np.array([logit_scale_grad], dtype=np.float32)
         temp_grad_arr: Optional[np.ndarray] = None
-        if self.learnable_temperature:
+        if self._temperature_param is not None:
             temp_grad = -common_term * self.logit_scale / (temp_value ** 2)
-            temp_grad_arr = np.array([temp_grad], dtype=np.float64)
+            temp_grad_arr = np.array([temp_grad], dtype=np.float32)
+        head_grad_list: List[Optional[np.ndarray]] = [
+            head_grads["W1"],
+            head_grads["b1"],
+            head_grads["W2"],
+            head_grads["b2"],
+        ]
+        if self._logit_scale_param is not None:
+            head_grad_list.append(logit_scale_grad_arr)
+        if self._temperature_param is not None:
+            head_grad_list.append(temp_grad_arr)
 
         neuron = self.cfg.neuron
         beta_value = (
@@ -1335,12 +1481,6 @@ class Trainer:
                 iteration_used = iteration
         truncation = max_steps
 
-        grads_to_clip = [
-            head_grads["W1"],
-            head_grads["b1"],
-            head_grads["W2"],
-            head_grads["b2"],
-        ]
         backbone_requires_update = not self._backbone_frozen
         grad_Wxh: Optional[np.ndarray]
         grad_Whh: Optional[np.ndarray]
@@ -1395,31 +1535,21 @@ class Trainer:
             iteration_used = steps
             if contraction_lambda > 0.0:
                 grad_Whh += 2.0 * contraction_lambda * self.model.Whh
-            grads_to_clip.extend([grad_Wxh, grad_Whh, grad_bh])
         else:
             grad_Wxh = grad_Whh = grad_bh = None
             residual_value = 0.0
             iteration_used = 0
 
-        if temp_grad_arr is not None:
-            grads_to_clip.append(temp_grad_arr)
-        _clip_gradient_norm(grads_to_clip, self.grad_clip)
-        self.model.head.apply_gradients(head_grads, lr, weight_decay=self.weight_decay)
-        if self.logit_scale_learnable:
-            logit_scale_grad = common_term / temp_value
-            updated_scale = self.logit_scale - lr * logit_scale_grad
-            self.logit_scale = float(np.clip(updated_scale, self.logit_scale_min, self.logit_scale_max))
-        else:
-            self.logit_scale = float(np.clip(self.logit_scale, self.logit_scale_min, self.logit_scale_max))
-        if temp_grad_arr is not None:
-            self._temperature = max(1e-6, self._temperature - lr * float(temp_grad_arr[0]))
-
         if backbone_requires_update and grad_Wxh is not None and grad_Whh is not None and grad_bh is not None:
-            _apply_decoupled_weight_decay(self.model.Wxh, lr, self.weight_decay)
-            _apply_decoupled_weight_decay(self.model.Whh, lr, self.weight_decay)
-            self.model.Wxh -= lr * grad_Wxh
-            self.model.Whh -= lr * grad_Whh
-            self.model.bh -= lr * grad_bh
+            rec_grad_list = [grad_Wxh, grad_Whh, grad_bh]
+        else:
+            rec_grad_list = [None] * self._rec_param_count
+        grad_norm, delta_norm = self._apply_optimizer(
+            head_grad_list,
+            rec_grad_list,
+            head_lr=head_lr,
+            rec_lr=rec_lr,
+        )
 
         if (
             self._backbone_frozen
@@ -1448,6 +1578,10 @@ class Trainer:
             s_rate=s_rate,
             logit_mean=logit_mean,
             logit_std=logit_std,
+            grad_norm=grad_norm,
+            delta_norm=delta_norm,
+            lr_head=head_lr,
+            lr_rec=rec_lr,
         )
 
     def evaluate(
@@ -1517,7 +1651,8 @@ class Trainer:
         self,
         batch_x: np.ndarray,
         batch_y: np.ndarray,
-        lr: float,
+        head_lr: float,
+        rec_lr: float,
         *,
         apical_coupling: Optional[float] = None,
         beta_override: Optional[float] = None,
@@ -1527,7 +1662,8 @@ class Trainer:
             return self._train_step_tstep(
                 batch_x,
                 batch_y,
-                lr,
+                head_lr,
+                rec_lr,
                 apical_coupling,
                 beta_override,
                 threshold_override,
@@ -1535,7 +1671,8 @@ class Trainer:
         return self._train_step_fpt(
             batch_x,
             batch_y,
-            lr,
+            head_lr,
+            rec_lr,
             apical_coupling,
             beta_override,
             threshold_override,
@@ -1584,6 +1721,22 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
 
     steps_per_epoch = math.ceil(total_examples / worker_cfg.hyper.batch_size)
     total_steps = max(1, epochs * steps_per_epoch)
+    warmup_steps = max(1, int(math.ceil(total_steps * 0.05)))
+    scheduler_restarts = worker_cfg.hyper.scheduler_restarts
+    head_scheduler = WarmupCosineScheduler(
+        worker_cfg.hyper.optimizer_head_lr,
+        total_steps,
+        warmup_steps=warmup_steps,
+        min_lr=max(1e-12, worker_cfg.hyper.optimizer_head_lr * 0.1),
+        restarts=scheduler_restarts,
+    )
+    rec_scheduler = WarmupCosineScheduler(
+        worker_cfg.hyper.optimizer_rec_lr,
+        total_steps,
+        warmup_steps=warmup_steps,
+        min_lr=max(1e-12, worker_cfg.hyper.optimizer_rec_lr * 0.1),
+        restarts=scheduler_restarts,
+    )
     async with NatsPublisher(worker_cfg.nats) as publisher:
         LOGGER.info(
             "Starting training: mode=%s epochs=%d steps_per_epoch=%d samples=%d augment=%s",
@@ -1605,7 +1758,8 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
         if augment_enabled and not apply_augment:
             LOGGER.info("数据集 %s 未匹配到图像形状，跳过增广", dataset_label)
         global_step = 0
-        last_lr = worker_cfg.hyper.lr
+        last_head_lr = worker_cfg.hyper.optimizer_head_lr
+        last_rec_lr = worker_cfg.hyper.optimizer_rec_lr
         for epoch in range(epochs):
             epoch_loss = 0.0
             epoch_nll = 0.0
@@ -1639,18 +1793,16 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 )
                 step_start = time.perf_counter()
                 global_step += 1
-                current_lr = _cosine_decay(
-                    global_step,
-                    worker_cfg.hyper.lr,
-                    worker_cfg.hyper.warmup_steps,
-                    total_steps,
-                )
-                last_lr = current_lr
+                head_lr = head_scheduler.step()
+                rec_lr = rec_scheduler.step()
+                last_head_lr = head_lr
+                last_rec_lr = rec_lr
                 try:
                     result = trainer.train_batch(
                         prepared_batch,
                         batch_y,
-                        current_lr,
+                        head_lr,
+                        rec_lr,
                         apical_coupling=g_apical_value,
                         beta_override=beta_override,
                         threshold_override=threshold_override,
@@ -1722,7 +1874,9 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                         "top5": result.top5,
                         "conf": result.confidence,
                         "entropy": result.entropy,
-                        "lr": current_lr,
+                        "lr": result.lr_head,
+                        "lr_head": result.lr_head,
+                        "lr_rec": result.lr_rec,
                         "temperature": trainer.temperature,
                         "logit_scale": trainer.logit_scale,
                         "mode": worker_cfg.mode,
@@ -1742,6 +1896,10 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                         metrics_payload["logit_mean"] = result.logit_mean
                     if result.logit_std is not None:
                         metrics_payload["logit_std"] = result.logit_std
+                    if result.grad_norm is not None:
+                        metrics_payload["grad_norm"] = result.grad_norm
+                    if result.delta_norm is not None:
+                        metrics_payload["delta_norm"] = result.delta_norm
                     spikes_payload = {
                         "epoch": epoch + 1,
                         "step": global_step,
@@ -1800,7 +1958,9 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 "top5": val_top5,
                 "conf": val_conf,
                 "entropy": val_entropy,
-                "lr": last_lr,
+                "lr": last_head_lr,
+                "lr_head": last_head_lr,
+                "lr_rec": last_rec_lr,
                 "temperature": trainer.temperature,
                 "logit_scale": trainer.logit_scale,
                 "train_loss": train_avg_loss,
@@ -1846,6 +2006,8 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 log_metric["avg_throughput"] = avg_throughput
             if residual_mean is not None:
                 log_metric["residual"] = residual_mean
+            log_metric["lr_head"] = last_head_lr
+            log_metric["lr_rec"] = last_rec_lr
             log_payload = {
                 "level": "INFO",
                 "msg": (
