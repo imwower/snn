@@ -49,10 +49,9 @@
       </fieldset>
     </div>
     <div class="buttons">
-      <button @click="initTraining" :disabled="initDisabled">初始化</button>
-      <button @click="toggleTraining" :disabled="trainButtonDisabled">
-        <span class="train-icon">{{ trainButtonIcon }}</span>
-        {{ trainButtonLabel }}
+      <button @click="handlePrimaryAction" :disabled="primaryButtonDisabled">
+        <span class="train-icon">{{ primaryButtonIcon }}</span>
+        {{ primaryButtonLabel }}
       </button>
     </div>
   </aside>
@@ -81,6 +80,7 @@ const DEFAULT_DATASETS: DatasetOption[] = [
 
 const datasetOptions = ref<DatasetOption[]>(ensureDefaultDatasets([{ value: store.cfg.dataset, label: store.cfg.dataset }]));
 const isBusy = ref(false);
+const hasInitialized = ref(false);
 
 const isTraining = computed(() => store.status === 'Training');
 const dataset = computed({
@@ -113,10 +113,7 @@ const epochs = computed({
 });
 
 const downloadLocked = computed(() => store.isDownloadActive || isBusy.value);
-const controlsLocked = computed(() => isBusy.value || store.isControlLocked);
 const parametersLocked = computed(() => isBusy.value || isTraining.value);
-const initDisabled = computed(() => controlsLocked.value || isTraining.value);
-const trainButtonDisabled = computed(() => isBusy.value);
 const downloadPercentText = computed(() => `${store.downloadPercent}%`);
 const downloadButtonText = computed(() => {
   if (store.isDownloadActive) {
@@ -126,8 +123,62 @@ const downloadButtonText = computed(() => {
   }
   return '下载到本地';
 });
-const trainButtonIcon = computed(() => (isTraining.value ? '■' : '▶'));
-const trainButtonLabel = computed(() => (isTraining.value ? '停止' : '训练'));
+const primaryButtonState = computed<'init' | 'initializing' | 'start' | 'stop'>(() => {
+  if (store.status === 'Initializing') {
+    return 'initializing';
+  }
+  if (isTraining.value) {
+    return 'stop';
+  }
+  if (hasInitialized.value) {
+    return 'start';
+  }
+  return 'init';
+});
+const primaryButtonDisabled = computed(() => isBusy.value || store.status === 'Initializing');
+const primaryButtonIcon = computed(() => {
+  switch (primaryButtonState.value) {
+    case 'init':
+      return '⚙';
+    case 'initializing':
+      return '…';
+    case 'stop':
+      return '■';
+    case 'start':
+    default:
+      return '▶';
+  }
+});
+const primaryButtonLabel = computed(() => {
+  switch (primaryButtonState.value) {
+    case 'init':
+      return '初始化';
+    case 'initializing':
+      return '初始化中…';
+    case 'stop':
+      return '停止';
+    case 'start':
+    default:
+      return '训练';
+  }
+});
+
+watch(
+  () => [
+    store.cfg.dataset,
+    store.cfg.mode,
+    store.cfg.network_size,
+    store.cfg.layers,
+    store.cfg.lr,
+    store.cfg.K,
+    store.cfg.tol,
+    store.cfg.T,
+    store.cfg.epochs
+  ],
+  () => {
+    hasInitialized.value = false;
+  }
+);
 
 const withBusy = async (task: () => Promise<void>, opts: { allowWhenDownloading?: boolean } = {}) => {
   if (isBusy.value) {
@@ -201,6 +252,7 @@ const initTraining = () =>
       });
       store.setStatus('Idle');
       store.pushPlainLog(`训练初始化完成：${store.cfg.dataset}`, 'INFO');
+      hasInitialized.value = true;
     } catch (err) {
       console.warn('Init failed', err);
       store.showToast('初始化训练失败', 'error');
@@ -231,11 +283,19 @@ const stopTraining = () =>
     }
   });
 
-const toggleTraining = () => {
-  if (isTraining.value) {
-    void stopTraining();
-  } else {
+const handlePrimaryAction = () => {
+  const state = primaryButtonState.value;
+  if (state === 'init') {
+    void initTraining();
+    return;
+  }
+  if (state === 'start') {
     void startTraining();
+    return;
+  }
+  if (state === 'stop') {
+    void stopTraining();
+    return;
   }
 };
 

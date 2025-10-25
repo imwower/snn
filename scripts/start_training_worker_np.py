@@ -220,20 +220,61 @@ def current_millis() -> int:
     return int(time.time() * 1000)
 
 
+def log_softmax(logits: np.ndarray) -> np.ndarray:
+    if logits.ndim != 2:
+        raise ValueError("logits must be a 2D array")
+    dtype = logits.dtype
+    logits64 = logits.astype(np.float64, copy=False)
+    max_logits = np.max(logits64, axis=1, keepdims=True)
+    shifted = logits64 - max_logits
+    logsumexp = np.log(np.sum(np.exp(shifted, dtype=np.float64), axis=1, keepdims=True))
+    log_probs = shifted - logsumexp
+    return log_probs.astype(dtype, copy=False)
+
+
 def softmax(logits: np.ndarray) -> np.ndarray:
-    shifted = logits - np.max(logits, axis=1, keepdims=True)
-    exp = np.exp(shifted, dtype=np.float64)
-    sums = np.sum(exp, axis=1, keepdims=True)
-    return exp / np.maximum(sums, 1e-12)
+    log_probs = log_softmax(logits)
+    probs = np.exp(log_probs.astype(np.float64, copy=False))
+    return probs.astype(logits.dtype, copy=False)
 
 
-def cross_entropy(logits: np.ndarray, targets: np.ndarray) -> Tuple[float, np.ndarray]:
+def nll_from_logits(logits: np.ndarray, targets: np.ndarray) -> Tuple[float, np.ndarray]:
     if targets.dtype != np.int64:
         raise TypeError("labels must be np.int64 for indexing")
-    probs = softmax(logits)
+    log_probs = log_softmax(logits)
+    if targets.size == 0:
+        return 0.0, log_probs
     idx = (np.arange(targets.shape[0]), targets)
-    log_probs = -np.log(np.maximum(probs[idx], 1e-12))
-    return float(np.mean(log_probs)), probs
+    nll = -log_probs[idx]
+    loss = float(np.mean(nll)) if nll.size else 0.0
+    return loss, log_probs
+
+
+def probabilities_and_stats(log_probs: np.ndarray, targets: np.ndarray) -> Tuple[np.ndarray, float, float, float, float]:
+    probs = np.exp(log_probs.astype(np.float64, copy=False))
+    batch = probs.shape[0]
+    if batch == 0:
+        return probs, 0.0, 0.0, 0.0, 0.0
+
+    entropy_values = -np.sum(probs * log_probs.astype(np.float64, copy=False), axis=1)
+    entropy = float(np.mean(entropy_values)) if entropy_values.size else 0.0
+
+    if targets.size == 0:
+        return probs, 0.0, 0.0, 0.0, entropy
+
+    preds = np.argmax(probs, axis=1)
+    top1 = float(np.mean(preds == targets))
+
+    topk = min(5, probs.shape[1])
+    if topk > 0:
+        topk_indices = np.argsort(-probs, axis=1)[:, :topk]
+        hits = np.any(topk_indices == targets[:, None], axis=1)
+        top5 = float(np.mean(hits))
+    else:
+        top5 = 0.0
+
+    confidence = float(np.mean(probs[np.arange(targets.shape[0]), targets]))
+    return probs, top1, top5, confidence, entropy
 
 
 # ---------------------------------------------------------------------------
@@ -412,12 +453,6 @@ class ThreeCompartmentModel:
         logits = h @ self.Wo.T + self.bo
         return logits, h_list, basal_list, apical_list, spikes
 
-    def predict(self, inputs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        logits, _, _, _, _, _ = self.forward(inputs)
-        probs = softmax(logits)
-        return logits, probs
-
-
 # ---------------------------------------------------------------------------
 # Training routines
 # ---------------------------------------------------------------------------
@@ -443,6 +478,9 @@ def _aggregate_spikes(spikes: Iterable[np.ndarray]) -> Tuple[int, List[int]]:
 class TrainStepResult:
     loss: float
     acc: float
+    top5: float
+    confidence: float
+    entropy: float
     spikes_total: int
     spikes_per_neuron: List[int]
     residual: Optional[float] = None
@@ -462,26 +500,33 @@ class Trainer:
     ]:
         return self.model.forward(batch_x)
 
+    @staticmethod
+    def _mean_soma_states(h_list: List[np.ndarray]) -> np.ndarray:
+        if len(h_list) <= 1:
+            raise ValueError("soma history must include at least one timestep")
+        soma_stack = np.stack(h_list[1:], axis=0)
+        return np.mean(soma_stack, axis=0)
+
     def _train_step_tstep(self, batch_x: np.ndarray, batch_y: np.ndarray) -> TrainStepResult:
         num_classes = self.model.network.output_dim
         assert batch_y.dtype == np.int64, "labels must be int64"
         if batch_y.size > 0:
             assert int(batch_y.min()) >= 0 and int(batch_y.max()) < num_classes, "labels out of range"
 
-        logits, h_list, _, _, spikes = self._forward_batch(batch_x)
+        _, h_list, _, _, spikes = self._forward_batch(batch_x)
+        features = self._mean_soma_states(h_list)
+        logits = features @ self.model.Wo.T + self.model.bo
         assert logits.shape[1] == num_classes, "logit dimension mismatch"
 
-        loss, probs = cross_entropy(logits, batch_y)
-        preds = np.argmax(probs, axis=1)
-        assert preds.shape == (batch_y.shape[0],), "argmax must operate along axis=1"
-        acc = float(np.mean(preds == batch_y))
+        loss, log_probs = nll_from_logits(logits, batch_y)
+        probs, acc, top5, confidence, entropy = probabilities_and_stats(log_probs, batch_y)
 
         grad_logits = probs
-        grad_logits[np.arange(batch_y.shape[0]), batch_y] -= 1.0
-        grad_logits /= batch_y.shape[0]
+        if batch_y.size:
+            grad_logits[np.arange(batch_y.shape[0]), batch_y] -= 1.0
+        grad_logits /= max(batch_y.shape[0], 1)
 
-        h_last = h_list[-1]
-        grad_Wo = grad_logits.T @ h_last
+        grad_Wo = grad_logits.T @ features
         grad_bo = np.sum(grad_logits, axis=0)
 
         hp = self.cfg.hyper
@@ -489,7 +534,15 @@ class Trainer:
         self.model.bo = self.model.bo - hp.lr * grad_bo
 
         total_spikes, per_neuron = _aggregate_spikes(spikes)
-        return TrainStepResult(loss=loss, acc=acc, spikes_total=total_spikes, spikes_per_neuron=per_neuron)
+        return TrainStepResult(
+            loss=loss,
+            acc=acc,
+            top5=top5,
+            confidence=confidence,
+            entropy=entropy,
+            spikes_total=total_spikes,
+            spikes_per_neuron=per_neuron,
+        )
 
     def _train_step_fpt(self, batch_x: np.ndarray, batch_y: np.ndarray) -> TrainStepResult:
         num_classes = self.model.network.output_dim
@@ -500,14 +553,13 @@ class Trainer:
         logits, h_list, _, _, spikes = self._forward_batch(batch_x)
         assert logits.shape[1] == num_classes, "logit dimension mismatch"
 
-        loss, probs = cross_entropy(logits, batch_y)
-        preds = np.argmax(probs, axis=1)
-        assert preds.shape == (batch_y.shape[0],), "argmax must operate along axis=1"
-        acc = float(np.mean(preds == batch_y))
+        loss, log_probs = nll_from_logits(logits, batch_y)
+        probs, acc, top5, confidence, entropy = probabilities_and_stats(log_probs, batch_y)
 
         grad_logits = probs
-        grad_logits[np.arange(batch_y.shape[0]), batch_y] -= 1.0
-        grad_logits /= batch_y.shape[0]
+        if batch_y.size:
+            grad_logits[np.arange(batch_y.shape[0]), batch_y] -= 1.0
+        grad_logits /= max(batch_y.shape[0], 1)
 
         hp = self.cfg.hyper
         neuron = self.cfg.neuron
@@ -571,27 +623,48 @@ class Trainer:
         return TrainStepResult(
             loss=loss,
             acc=acc,
+            top5=top5,
+            confidence=confidence,
+            entropy=entropy,
             spikes_total=total_spikes,
             spikes_per_neuron=per_neuron,
             residual=residual_value,
         )
 
-    def evaluate(self, data_x: np.ndarray, data_y: np.ndarray, batch_size: int) -> Tuple[float, float]:
+    def evaluate(
+        self, data_x: np.ndarray, data_y: np.ndarray, batch_size: int
+    ) -> Tuple[float, float, float, float, float]:
         total_loss = 0.0
         total_acc = 0.0
+        total_top5 = 0.0
+        total_conf = 0.0
+        total_entropy = 0.0
         count = 0
         for start in range(0, data_x.shape[0], batch_size):
             end = start + batch_size
             batch_x = data_x[start:end]
             batch_y = data_y[start:end]
-            logits, probs = self.model.predict(batch_x)
-            loss, _ = cross_entropy(logits, batch_y)
-            preds = np.argmax(probs, axis=1)
-            acc = float(np.mean(preds == batch_y))
-            total_loss += loss * batch_x.shape[0]
-            total_acc += acc * batch_x.shape[0]
-            count += batch_x.shape[0]
-        return total_loss / max(count, 1), total_acc / max(count, 1)
+            logits, h_list, _, _, _ = self._forward_batch(batch_x)
+            if self.cfg.mode == "tstep":
+                features = self._mean_soma_states(h_list)
+                logits = features @ self.model.Wo.T + self.model.bo
+            loss, log_probs = nll_from_logits(logits, batch_y)
+            _, acc, top5, confidence, entropy = probabilities_and_stats(log_probs, batch_y)
+            batch_count = batch_x.shape[0]
+            total_loss += loss * batch_count
+            total_acc += acc * batch_count
+            total_top5 += top5 * batch_count
+            total_conf += confidence * batch_count
+            total_entropy += entropy * batch_count
+            count += batch_count
+        denom = max(count, 1)
+        return (
+            total_loss / denom,
+            total_acc / denom,
+            total_top5 / denom,
+            total_conf / denom,
+            total_entropy / denom,
+        )
 
     def train_batch(self, batch_x: np.ndarray, batch_y: np.ndarray) -> TrainStepResult:
         if self.cfg.mode == "tstep":
@@ -630,6 +703,9 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
         for epoch in range(epochs):
             epoch_loss = 0.0
             epoch_acc = 0.0
+            epoch_top5 = 0.0
+            epoch_conf = 0.0
+            epoch_entropy = 0.0
             epoch_examples = 0
             epoch_throughputs: List[float] = []
             epoch_residuals: List[float] = []
@@ -640,6 +716,9 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 batch_size = batch_x.shape[0]
                 epoch_loss += result.loss * batch_size
                 epoch_acc += result.acc * batch_size
+                epoch_top5 += result.top5 * batch_size
+                epoch_conf += result.confidence * batch_size
+                epoch_entropy += result.entropy * batch_size
                 epoch_examples += batch_size
                 global_step += 1
                 throughput = float(batch_size / step_duration)
@@ -653,7 +732,11 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                         "epoch": epoch + 1,
                         "step": global_step,
                         "loss": result.loss,
+                        "nll": result.loss,
                         "acc": result.acc,
+                        "top5": result.top5,
+                        "conf": result.confidence,
+                        "entropy": result.entropy,
                         "mode": worker_cfg.mode,
                         "examples": batch_size,
                         "throughput": throughput,
@@ -675,9 +758,15 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                     spike_subject = f"{worker_cfg.nats.subjects.spikes}.0"
                     await publisher.publish_json(spike_subject, spikes_payload)
 
-            train_avg_loss = epoch_loss / max(epoch_examples, 1)
-            train_avg_acc = epoch_acc / max(epoch_examples, 1)
-            val_loss, val_acc = trainer.evaluate(val_x, val_y, worker_cfg.hyper.batch_size)
+            denom = max(epoch_examples, 1)
+            train_avg_loss = epoch_loss / denom
+            train_avg_acc = epoch_acc / denom
+            train_avg_top5 = epoch_top5 / denom
+            train_avg_conf = epoch_conf / denom
+            train_avg_entropy = epoch_entropy / denom
+            val_loss, val_acc, val_top5, val_conf, val_entropy = trainer.evaluate(
+                val_x, val_y, worker_cfg.hyper.batch_size
+            )
             avg_throughput = float(np.mean(epoch_throughputs)) if epoch_throughputs else None
             residual_mean = float(np.mean(epoch_residuals)) if epoch_residuals else None
 
@@ -685,9 +774,17 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 "phase": "val",
                 "epoch": epoch + 1,
                 "loss": val_loss,
+                "nll": val_loss,
                 "acc": val_acc,
+                "top5": val_top5,
+                "conf": val_conf,
+                "entropy": val_entropy,
                 "train_loss": train_avg_loss,
+                "train_nll": train_avg_loss,
                 "train_acc": train_avg_acc,
+                "train_top5": train_avg_top5,
+                "train_conf": train_avg_conf,
+                "train_entropy": train_avg_entropy,
                 "mode": worker_cfg.mode,
                 "avg_throughput": avg_throughput,
                 "time_unix": current_millis(),
@@ -699,8 +796,14 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
             log_metric = {
                 "train_loss": train_avg_loss,
                 "train_acc": train_avg_acc,
+                "train_top5": train_avg_top5,
+                "train_conf": train_avg_conf,
+                "train_entropy": train_avg_entropy,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
+                "val_top5": val_top5,
+                "val_conf": val_conf,
+                "val_entropy": val_entropy,
             }
             if avg_throughput is not None:
                 log_metric["avg_throughput"] = avg_throughput
@@ -710,8 +813,9 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 "level": "INFO",
                 "msg": (
                     f"[epoch {epoch + 1}/{epochs}] mode={worker_cfg.mode} "
-                    f"train_loss={train_avg_loss:.4f} train_acc={train_avg_acc:.4f} "
-                    f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+                    f"train_loss={train_avg_loss:.4f} train_acc={train_avg_acc:.4f} train_top5={train_avg_top5:.4f} "
+                    f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_top5={val_top5:.4f} "
+                    f"conf={val_conf:.4f} entropy={val_entropy:.4f}"
                     + (f" residual={residual_mean:.6f}" if residual_mean is not None else "")
                     + (f" avg_throughput={avg_throughput:.2f}" if avg_throughput is not None else "")
                 ),

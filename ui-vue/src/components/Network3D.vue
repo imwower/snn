@@ -6,6 +6,9 @@
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial';
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry';
 import { useUiStore } from '../store/ui';
 import type { LayerLayout, SpikeEntry } from '../types';
 
@@ -26,11 +29,12 @@ let nodeColorAttr: THREE.InstancedBufferAttribute | null = null;
 let nodeGeometry: THREE.SphereGeometry | null = null;
 let nodeMaterial: THREE.MeshPhongMaterial | null = null;
 
-let edgeGeometry: THREE.BufferGeometry | null = null;
-let edgeMaterial: THREE.LineBasicMaterial | null = null;
-let edgeSegments: THREE.LineSegments | null = null;
+let edgeGeometry: LineSegmentsGeometry | null = null;
+let edgeMaterial: LineMaterial | null = null;
+let edgeSegments: LineSegments2 | null = null;
 let edgeColors = new Float32Array(0);
-let edgeColorAttr: THREE.BufferAttribute | null = null;
+let edgeColorAttrStart: THREE.InterleavedBufferAttribute | null = null;
+let edgeColorAttrEnd: THREE.InterleavedBufferAttribute | null = null;
 let edgeIntensity = new Float32Array(0);
 let edgeIndexMap = new Map<string, number>();
 let nodeToEdges = new Map<number, number[]>();
@@ -39,7 +43,7 @@ let edgesList: Array<{ src: number; dst: number }> = [];
 const baseNodeColor = new THREE.Color('#1d4ed8');
 const highlightNodeColor = new THREE.Color('#fde047');
 const baseEdgeColor = new THREE.Color('#1f2937');
-const highlightEdgeColor = new THREE.Color('#fde047');
+const highlightEdgeColor = new THREE.Color('#f97316');
 const baseEdgeHSL = { h: 0, s: 0, l: 0 };
 const highlightEdgeHSL = { h: 0, s: 0, l: 0 };
 baseEdgeColor.getHSL(baseEdgeHSL);
@@ -83,7 +87,8 @@ const disposeEdges = () => {
   edgeGeometry = null;
   edgeMaterial = null;
   edgeColors = new Float32Array(0);
-  edgeColorAttr = null;
+  edgeColorAttrStart = null;
+  edgeColorAttrEnd = null;
   edgeIntensity = new Float32Array(0);
   edgeIndexMap = new Map();
   nodeToEdges = new Map();
@@ -141,7 +146,6 @@ const buildEdges = (layouts: LayerLayout[]) => {
     return;
   }
 
-  edgeGeometry = new THREE.BufferGeometry();
   const positions = new Float32Array(edgesList.length * 6);
   edgeColors = new Float32Array(edgesList.length * 6);
   edgeIntensity = new Float32Array(edgesList.length);
@@ -167,20 +171,25 @@ const buildEdges = (layouts: LayerLayout[]) => {
     }
   });
 
-  edgeGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  edgeColorAttr = new THREE.BufferAttribute(edgeColors, 3);
-  edgeGeometry.setAttribute('color', edgeColorAttr);
+  edgeGeometry = new LineSegmentsGeometry();
+  edgeGeometry.setPositions(positions);
+  edgeGeometry.setColors(edgeColors);
+  edgeColorAttrStart = edgeGeometry.getAttribute('instanceColorStart') as THREE.InterleavedBufferAttribute;
+  edgeColorAttrEnd = edgeGeometry.getAttribute('instanceColorEnd') as THREE.InterleavedBufferAttribute;
 
-  edgeMaterial = new THREE.LineBasicMaterial({
+  edgeMaterial = new LineMaterial({
     vertexColors: true,
     transparent: true,
-    opacity: 0.5,
-    linewidth: 2,
+    opacity: 0.45,
+    linewidth: 3.2,
     depthWrite: false,
     blending: THREE.AdditiveBlending
   });
+  const width = container.value?.clientWidth ?? window.innerWidth;
+  const height = container.value?.clientHeight ?? window.innerHeight;
+  edgeMaterial.resolution.set(Math.max(1, width), Math.max(1, height));
 
-  edgeSegments = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+  edgeSegments = new LineSegments2(edgeGeometry, edgeMaterial);
   scene.add(edgeSegments);
 };
 
@@ -198,7 +207,7 @@ const buildNodes = (layouts: LayerLayout[]) => {
   nodePositions = new Float32Array(totalInstances * 3);
   nodeColors = new Float32Array(totalInstances * 3);
   glow = new Float32Array(totalInstances);
-  nodeGeometry = new THREE.SphereGeometry(0.25, 20, 20);
+  nodeGeometry = new THREE.SphereGeometry(0.18, 18, 18);
   nodeMaterial = new THREE.MeshPhongMaterial({
     color: 0xffffff,
     emissive: 0x0e223a,
@@ -330,8 +339,13 @@ const highlightEdges = (edgePairs: Array<[number, number]> | undefined, neurons:
       });
     });
   }
-  if (touched.size > 0 && edgeColorAttr) {
-    edgeColorAttr.needsUpdate = true;
+  if (touched.size > 0) {
+    if (edgeColorAttrStart?.data) {
+      edgeColorAttrStart.data.needsUpdate = true;
+    }
+    if (edgeColorAttrEnd?.data) {
+      edgeColorAttrEnd.data.needsUpdate = true;
+    }
   }
   return touched;
 };
@@ -428,8 +442,11 @@ const animate = () => {
     edgeColors[colorOffset + 4] = edgeTempColor.g;
     edgeColors[colorOffset + 5] = edgeTempColor.b;
   }
-  if (edgeColorAttr) {
-    edgeColorAttr.needsUpdate = true;
+  if (edgeColorAttrStart?.data) {
+    edgeColorAttrStart.data.needsUpdate = true;
+  }
+  if (edgeColorAttrEnd?.data) {
+    edgeColorAttrEnd.data.needsUpdate = true;
   }
   if (edgeMaterial) {
     edgeMaterial.opacity = 0.25 + Math.min(0.6, maxEdge * 0.85);
@@ -450,6 +467,9 @@ const resize = () => {
   camera.aspect = clientWidth / clientHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(clientWidth, clientHeight);
+  if (edgeMaterial) {
+    edgeMaterial.resolution.set(Math.max(1, clientWidth), Math.max(1, clientHeight));
+  }
 };
 
 onMounted(() => {
