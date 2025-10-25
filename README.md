@@ -70,7 +70,7 @@ docker compose up -d
 
 参考类型定义：`ui-vue/src/types.ts`。
 
-默认训练配置将 `steps_per_epoch` 设为 ≥128，用于在小数据集上重复采样 batch，同时在前向最后一步按 `logit_scale=1.25` 放大 logits。可通过 `training_service.steps_per_epoch` 与 `training_service.logit_scale` 调整，事件流会在 `train_init` / `metrics_*` 中上报这两个数值，便于 UI 同步显示。
+默认训练配置会根据当前数据集样本数自动设置 `steps_per_epoch = ceil(N_{\text{train}} / batch_size)`，不再需要手动硬编码 128；同时在前向最后一步按 `logit_scale=1.25` 放大 logits。训练前端到端会以 NumPy 计算每个特征的 mean/std（存放在 `.data/datasets/<name>/mean.npy|std.npy`），并在训练阶段启用轻量增广（平移±2 像素、随机左右翻转、随机裁剪+Pad）以避免过拟合，可通过 `training_service.augment` 开关。
 
 ### 5.3 启动前端 UI
 

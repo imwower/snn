@@ -131,6 +131,7 @@ export interface TrainInitEvent {
   grad_clip?: number;
   weight_decay?: number;
   rate_target?: number;
+  augment?: boolean;
   time_unix?: number;
 }
 

@@ -35,6 +35,7 @@ except Exception:  # pragma: no cover - 未安装 nats-py
     NATSClient = None  # type: ignore
 
 from .config import get_message_queue_config, load_config
+from .data import DATASET_IMAGE_SHAPES, ensure_feature_stats, standardize_batch, augment_flat_batch
 from .fpt import FixedPointConfig, fixed_point_parallel_solve
 from .mq import InMemoryQueue, Message, MessageQueue, build_message_queue
 from .neuron import ThreeCompartmentParams
@@ -109,7 +110,8 @@ class TrainingInitRequest(BaseModel):
     temperature: float = Field(default=1.0, gt=0.0, description="Logit temperature 缩放系数")
     logit_scale: float = Field(default=1.25, gt=0.0, description="Logit 幅度缩放系数")
     logit_scale_learnable: bool = Field(default=False, description="logit_scale 是否作为可学习参数")
-    steps_per_epoch: int = Field(default=128, ge=1, description="每个 epoch 的 batch 数")
+    steps_per_epoch: Optional[int] = Field(default=None, ge=1, description="每个 epoch 的 batch 数（空则自动计算）")
+    augment: bool = Field(default=True, description="是否对训练批次应用轻量数据增广")
 
 
 class DatasetDownloadRequest(BaseModel):
@@ -190,6 +192,10 @@ class DatasetBundle:
     val_y: np.ndarray
     input_dim: int
     num_classes: int
+    feature_mean: Optional[np.ndarray] = None
+    feature_std: Optional[np.ndarray] = None
+    image_shape: Optional[Tuple[int, int, int]] = None
+    name: Optional[str] = None
 
 
 @dataclass
@@ -842,7 +848,8 @@ class TrainingService:
             "grad_clip": 1.0,
             "rate_reg_lambda": 1e-3,
             "rate_target": 0.2,
-            "steps_per_epoch": 128,
+            "steps_per_epoch": None,
+            "augment": True,
         }
         self._config = self._apply_overrides(base_config, defaults or {})
         self._task: Optional[asyncio.Task[None]] = None
@@ -891,6 +898,7 @@ class TrainingService:
             "rate_reg_lambda",
             "rate_target",
             "steps_per_epoch",
+            "augment",
         ]
         for field in simple_fields:
             if field in overrides and not isinstance(overrides[field], dict):
@@ -937,6 +945,54 @@ class TrainingService:
                 )
 
         return merged
+
+    def _prepare_inputs(
+        self,
+        batch: np.ndarray,
+        dataset: DatasetBundle,
+        *,
+        rng: Optional[np.random.Generator],
+        augment: bool,
+    ) -> np.ndarray:
+        prepared = batch.astype(np.float32, copy=False)
+        if augment and dataset.image_shape is not None:
+            if rng is None:
+                raise ValueError("rng must be provided when augmentation is enabled")
+            prepared = augment_flat_batch(prepared, dataset.image_shape, rng)
+        if dataset.feature_mean is not None and dataset.feature_std is not None:
+            prepared = standardize_batch(prepared, dataset.feature_mean, dataset.feature_std)
+        if not np.all(np.isfinite(prepared)):
+            raise FloatingPointError("检测到非有限的输入特征，标准化或增广流程可能异常")
+        return prepared
+
+    async def _log_dataset_stats(self, dataset: DatasetBundle) -> None:
+        if dataset.feature_mean is None or dataset.feature_std is None:
+            return
+        mean = dataset.feature_mean
+        std = dataset.feature_std
+        def _fmt(values: np.ndarray) -> List[float]:
+            return [round(float(v), 4) for v in values.tolist()]
+        mean_head = _fmt(mean[:3])
+        mean_tail = _fmt(mean[-3:])
+        std_head = _fmt(std[:3])
+        std_tail = _fmt(std[-3:])
+        mean_span = float(np.max(mean) - np.min(mean))
+        std_min = float(np.min(std))
+        message = (
+            f"[data] dataset={dataset.name or 'unknown'} mean_head={mean_head} "
+            f"mean_tail={mean_tail} std_head={std_head} std_tail={std_tail} "
+            f"span={mean_span:.4f} std_min={std_min:.4f}"
+        )
+        metric = {
+            "dataset": dataset.name,
+            "mean_head": mean_head,
+            "mean_tail": mean_tail,
+            "std_head": std_head,
+            "std_tail": std_tail,
+            "mean_span": mean_span,
+            "std_min": std_min,
+        }
+        await self._emit_log("INFO", message, metric=metric)
 
     async def emit_config_summary(self, reason: str = "startup") -> None:
         """Publish a log event summarizing the active training configuration."""
@@ -1066,6 +1122,7 @@ class TrainingService:
                 "grad_clip": self._config.get("grad_clip"),
                 "rate_reg_lambda": self._config.get("rate_reg_lambda"),
                 "rate_target": self._config.get("rate_target"),
+                "augment": bool(self._config.get("augment", True)),
                 "time_unix": _current_millis(),
             },
         )
@@ -1160,6 +1217,8 @@ class TrainingService:
         )
         rate_target = float(_train_param("rate_target", config.get("rate_target", 0.2)))
         rate_reg_value = rate_reg_lambda
+        augment_enabled = bool(_train_param("augment", config.get("augment", True)))
+        self._config["augment"] = augment_enabled
         num_classes = dataset.num_classes
         batch_size = int(np.clip(config.get("network_size", 256), 32, 256))
         layers_count = max(1, int(config.get("layers", 1)))
@@ -1172,21 +1231,28 @@ class TrainingService:
         train_x = dataset.train_x
         train_y = dataset.train_y
         total_examples = train_x.shape[0]
-        base_step_estimate = math.ceil(total_examples / batch_size) if total_examples > 0 else 1
-        default_steps = max(100, base_step_estimate)
-        configured_steps = _train_param("steps_per_epoch", config.get("steps_per_epoch", default_steps))
-        steps_per_epoch = max(1, int(configured_steps if configured_steps is not None else default_steps))
-        total_steps = max(1, epochs * steps_per_epoch)
-        warmup_steps = max(1, int(math.ceil(total_steps * 0.05)))
         if total_examples == 0:
             raise RuntimeError("训练集样本数量为 0，无法开始训练")
+        steps_per_epoch = math.ceil(total_examples / batch_size)
+        requested_steps = self._config.get("steps_per_epoch")
+        if requested_steps not in (None, steps_per_epoch):
+            await self._emit_log(
+                "INFO",
+                (
+                    f"steps_per_epoch 覆盖值 {requested_steps} 已被忽略，"
+                    f"根据样本量改用 {steps_per_epoch}"
+                ),
+            )
+        self._config["steps_per_epoch"] = steps_per_epoch
+        total_steps = max(1, epochs * steps_per_epoch)
+        warmup_steps = max(1, int(math.ceil(total_steps * 0.05)))
         await self._emit_log(
             "INFO",
             (
                 f"using solver={solver} K={base_iterations} T={timesteps} "
                 f"temperature={temperature} K_schedule={k_schedule_label} "
                 f"scheduler={scheduler_name} warmup={warmup_steps} steps_per_epoch={steps_per_epoch} "
-                f"rate_reg={rate_reg_value} grad_clip={grad_clip}"
+                f"rate_reg={rate_reg_value} grad_clip={grad_clip} augment={'on' if augment_enabled else 'off'}"
             ),
             metric={
                 "solver": solver,
@@ -1204,13 +1270,15 @@ class TrainingService:
                 "logit_scale_learnable": logit_scale_learnable,
                 "weight_decay": weight_decay,
                 "steps_per_epoch": steps_per_epoch,
+                "augment": augment_enabled,
             },
         )
         await self._emit_log(
             "INFO",
             (
                 "config summary: mode=%s lr=%.5f min_lr=%.5f weight_decay=%.4f grad_clip=%.2f "
-                "scheduler=%s warmup_steps=%d steps_per_epoch=%d logit_scale=%.3f rate_target=%s"
+                "scheduler=%s warmup_steps=%d steps_per_epoch=%d logit_scale=%.3f rate_target=%s "
+                "augment=%s"
             )
             % (
                 config.get("mode", "fpt"),
@@ -1223,6 +1291,7 @@ class TrainingService:
                 steps_per_epoch,
                 initial_logit_scale,
                 rate_target,
+                "on" if augment_enabled else "off",
             ),
         )
 
@@ -1237,6 +1306,7 @@ class TrainingService:
                 f"input_dim={dataset.input_dim} num_classes={num_classes}"
             ),
         )
+        await self._log_dataset_stats(dataset)
         await self._emit_log(
             "DEBUG",
             f"训练集标签分布：{train_counts}; 验证集标签分布：{val_counts}",
@@ -1251,11 +1321,7 @@ class TrainingService:
         try:
             for epoch in range(1, epochs + 1):
                 epoch_start = time.perf_counter()
-                samples_this_epoch = steps_per_epoch * batch_size
-                repeat_factor = math.ceil(samples_this_epoch / total_examples)
-                epoch_indices = np.concatenate(
-                    [np_rng.permutation(total_examples) for _ in range(repeat_factor)]
-                )[:samples_this_epoch]
+                epoch_indices = np_rng.permutation(total_examples)
                 batch_throughputs: List[float] = []
                 epoch_loss_total = 0.0
                 epoch_acc_total = 0.0
@@ -1301,10 +1367,18 @@ class TrainingService:
     
                     offset = step * batch_size
                     batch_idx = epoch_indices[offset : offset + batch_size]
-                    batch_x = train_x[batch_idx]
+                    if batch_idx.size == 0:
+                        continue
+                    batch_raw = train_x[batch_idx]
                     batch_y = train_y[batch_idx]
-    
-                    batch_size_actual = batch_x.shape[0]
+                    batch_x = self._prepare_inputs(
+                        batch_raw,
+                        dataset,
+                        rng=np_rng,
+                        augment=augment_enabled,
+                    )
+
+                    batch_size_actual = batch_idx.shape[0]
                     if batch_y.dtype != np.int64:
                         raise AssertionError(f"batch labels must be int64, got {batch_y.dtype}")
                     if batch_y.size > 0:
@@ -1518,8 +1592,7 @@ class TrainingService:
                     val_s_rate,
                 ) = self._evaluate(
                     model,
-                    dataset.val_x,
-                    dataset.val_y,
+                    dataset,
                     kernel,
                     temperature,
                     batch_size=512,
@@ -1703,8 +1776,21 @@ class TrainingService:
             test_y = data["y_test"].astype(np.int64)
         train_x = train_x.reshape(train_x.shape[0], -1)
         test_x = test_x.reshape(test_x.shape[0], -1)
+        feature_mean, feature_std = ensure_feature_stats(train_x, dataset_dir)
         num_classes = int(np.max(np.concatenate([train_y, test_y])) + 1)
-        return DatasetBundle(train_x, train_y, test_x, test_y, train_x.shape[1], num_classes)
+        image_shape = DATASET_IMAGE_SHAPES["MNIST"]
+        return DatasetBundle(
+            train_x,
+            train_y,
+            test_x,
+            test_y,
+            train_x.shape[1],
+            num_classes,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+            image_shape=image_shape,
+            name="MNIST",
+        )
 
     def _generate_placeholder_mnist(self, target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1750,8 +1836,21 @@ class TrainingService:
         train_y = _read_idx_labels(train_labels)
         test_x = _read_idx_images(test_images)
         test_y = _read_idx_labels(test_labels)
+        feature_mean, feature_std = ensure_feature_stats(train_x, dataset_dir)
         num_classes = int(np.max(np.concatenate([train_y, test_y])) + 1)
-        return DatasetBundle(train_x, train_y, test_x, test_y, train_x.shape[1], num_classes)
+        image_shape = DATASET_IMAGE_SHAPES["FASHION"]
+        return DatasetBundle(
+            train_x,
+            train_y,
+            test_x,
+            test_y,
+            train_x.shape[1],
+            num_classes,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+            image_shape=image_shape,
+            name="FASHION",
+        )
 
     def _load_cifar10(self) -> DatasetBundle:
         dataset_dir = self._data_root / "cifar10"
@@ -1761,8 +1860,25 @@ class TrainingService:
         train_x, train_y, test_x, test_y = _load_cifar_arrays(dataset_dir, tar_path)
         train_x = (train_x / 255.0).astype(np.float32)
         test_x = (test_x / 255.0).astype(np.float32)
+        train_count = train_x.shape[0]
+        test_count = test_x.shape[0]
+        train_x = np.transpose(train_x.reshape(train_count, 3, 32, 32), (0, 2, 3, 1)).reshape(train_count, -1)
+        test_x = np.transpose(test_x.reshape(test_count, 3, 32, 32), (0, 2, 3, 1)).reshape(test_count, -1)
+        feature_mean, feature_std = ensure_feature_stats(train_x, dataset_dir)
         num_classes = int(np.max(np.concatenate([train_y, test_y])) + 1)
-        return DatasetBundle(train_x, train_y, test_x, test_y, train_x.shape[1], num_classes)
+        image_shape = DATASET_IMAGE_SHAPES["CIFAR10"]
+        return DatasetBundle(
+            train_x,
+            train_y,
+            test_x,
+            test_y,
+            train_x.shape[1],
+            num_classes,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+            image_shape=image_shape,
+            name="CIFAR10",
+        )
 
     def _init_model(
         self,
@@ -1948,14 +2064,15 @@ class TrainingService:
     def _evaluate(
         self,
         model: ModelState,
-        inputs: np.ndarray,
-        labels: np.ndarray,
+        dataset: DatasetBundle,
         kernel: np.ndarray,
         temperature: float,
         batch_size: int = 512,
         *,
         is_tstep: bool = False,
     ) -> Tuple[float, float, float, float, float, float, float, float]:
+        inputs = dataset.val_x
+        labels = dataset.val_y
         total = inputs.shape[0]
         losses: List[float] = []
         accs: List[float] = []
@@ -1970,6 +2087,9 @@ class TrainingService:
             end = start + batch_size
             batch_x = inputs[start:end]
             batch_y = labels[start:end]
+            if batch_x.size == 0:
+                continue
+            batch_x = self._prepare_inputs(batch_x, dataset, rng=None, augment=False)
             logits_raw, basal_currents = self._forward_batch(model, batch_x, kernel)
             logits_source = logits_raw
             batch_s_rate = 0.0
