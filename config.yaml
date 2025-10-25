@@ -88,25 +88,25 @@ training_service:
   layers: 2
   epochs: 20
   lr: 0.001
-  scheduler:
-    type: cosine
-    warmup_steps: 200
-    min_lr_scale: 0.1
+  scheduler: warmup_cosine
+  warmup_steps: 200
+  min_lr_scale: 0.1
+  min_lr: null
   weight_decay: 0.0001
   grad_clip: 1.0
   K: 4
   tol: 1.0e-5
   T: 12
-  solver:
-    type: anderson
-    anderson_m: 4
-    anderson_beta: 0.5
-    K_schedule: auto
+  solver: anderson
+  anderson_m: 4
+  anderson_beta: 0.5
+  K_schedule: auto
   temperature: 1.0
-  logit_scale:
-    value: 1.25
-    learnable: false
+  logit_scale: 1.25
+  logit_scale_learnable: false
   tstep_regularization:
     rate_reg_lambda: 0.001
     rate_target: 0.2
+  rate_reg_lambda: 0.001
+  rate_target: 0.2
   steps_per_epoch: 128

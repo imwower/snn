@@ -826,7 +826,7 @@ class TrainingService:
             "tol": 1e-5,
             "T": 12,
             "epochs": 20,
-            "solver": "plain",
+            "solver": "anderson",
             "anderson_m": 4,
             "anderson_beta": 0.5,
             "K_schedule": None,
@@ -834,8 +834,8 @@ class TrainingService:
             "logit_scale": 1.25,
             "logit_scale_learnable": False,
             "epochs": 20,
-            "warmup_steps": 0,
-            "scheduler": "cosine",
+            "warmup_steps": 200,
+            "scheduler": "warmup_cosine",
             "min_lr": None,
             "min_lr_scale": 0.1,
             "weight_decay": 1e-4,
@@ -937,6 +937,63 @@ class TrainingService:
                 )
 
         return merged
+
+    async def emit_config_summary(self, reason: str = "startup") -> None:
+        """Publish a log event summarizing the active training configuration."""
+        config = self.get_config()
+        dataset = config.get("dataset")
+        mode = config.get("mode")
+        solver = config.get("solver")
+        scheduler = config.get("scheduler")
+        warmup_steps = config.get("warmup_steps")
+        steps_per_epoch = config.get("steps_per_epoch")
+        lr = config.get("lr")
+        weight_decay = config.get("weight_decay")
+        grad_clip = config.get("grad_clip")
+        logit_scale = config.get("logit_scale")
+        rate_reg_lambda = config.get("rate_reg_lambda")
+        rate_target = config.get("rate_target")
+        anderson_m = config.get("anderson_m")
+        anderson_beta = config.get("anderson_beta")
+        network_size = config.get("network_size")
+        layers = config.get("layers")
+        epochs = config.get("epochs")
+
+        def _fmt(value: Any, fmt: str = ".4f") -> str:
+            if value is None:
+                return "n/a"
+            if isinstance(value, float):
+                return format(value, fmt)
+            return str(value)
+
+        message = (
+            f"[config:{reason}] dataset={dataset} mode={mode} epochs={epochs} layers={layers} "
+            f"neurons={network_size} lr={_fmt(lr)} solver={solver} anderson_m={anderson_m} "
+            f"anderson_beta={_fmt(anderson_beta)} scheduler={scheduler} warmup={warmup_steps} "
+            f"steps_per_epoch={steps_per_epoch} weight_decay={_fmt(weight_decay)} "
+            f"grad_clip={_fmt(grad_clip)} logit_scale={_fmt(logit_scale)} "
+            f"rate_reg_lambda={_fmt(rate_reg_lambda)} rate_target={_fmt(rate_target)}"
+        )
+        metric = {
+            "dataset": dataset,
+            "mode": mode,
+            "epochs": epochs,
+            "layers": layers,
+            "network_size": network_size,
+            "lr": lr,
+            "solver": solver,
+            "anderson_m": anderson_m,
+            "anderson_beta": anderson_beta,
+            "scheduler": scheduler,
+            "warmup_steps": warmup_steps,
+            "steps_per_epoch": steps_per_epoch,
+            "weight_decay": weight_decay,
+            "grad_clip": grad_clip,
+            "logit_scale": logit_scale,
+            "rate_reg_lambda": rate_reg_lambda,
+            "rate_target": rate_target,
+        }
+        await self._emit_log("INFO", message, metric=metric)
 
     async def _emit_log(
         self,
@@ -1982,6 +2039,7 @@ def create_app(message_queue_config: Optional[Dict[str, Any]] = None) -> FastAPI
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         await relay.start()
+        await training_service.emit_config_summary(reason="startup")
         try:
             yield
         finally:
