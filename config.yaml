@@ -41,21 +41,27 @@ training_worker:
       value: 1.0
       learnable: false
     logit_scale:
-      value: 1.0
+      value: 1.25
       learnable: false
     solver:
       type: anderson
       anderson_m: 4
       anderson_beta: 0.5
       K_schedule: auto
-    rate_reg_lambda: 0.0
-    rate_target: 0.1
+    rate_reg_lambda: 0.001
+    rate_target: 0.2
     tstep_regularization:
-      rate_reg_lambda: 0.0
-      rate_target: 0.1
+      rate_reg_lambda: 0.001
+      rate_target: 0.2
     g_apical:
       start: 0.5
       end: 0.2
+    beta:
+      start: 0.035
+      end: 0.03
+    v_th:
+      start: -0.053
+      end: -0.055
   neuron:
     dt: 0.001
     tau_soma: 0.02
@@ -98,8 +104,9 @@ training_service:
     K_schedule: auto
   temperature: 1.0
   logit_scale:
-    value: 1.0
+    value: 1.25
     learnable: false
   tstep_regularization:
-    rate_reg_lambda: 0.0
-    rate_target: 0.1
+    rate_reg_lambda: 0.001
+    rate_target: 0.2
+  steps_per_epoch: 128

@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -71,8 +72,8 @@ class HyperParams:
     anderson_beta: float = 0.5
     K_schedule: Optional[str] = None
     logit_scale: float = 1.0
-    rate_reg_lambda: float = 0.0
-    rate_target: float = 0.0
+    rate_reg_lambda: float = 1e-3
+    rate_target: float = 0.2
     g_apical_start: float = 0.5
     g_apical_end: float = 0.2
     beta_start: Optional[float] = None
@@ -81,6 +82,7 @@ class HyperParams:
     v_th_end: Optional[float] = None
     contraction_rho: float = 0.9
     contraction_lambda: float = 0.0
+    fp_tolerance: float = 1e-5
 
 
 @dataclass(frozen=True)
@@ -192,6 +194,20 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         output_dim=int(network_raw.get("output_dim", 10)),
     )
 
+    neuron_raw = worker_raw.get("neuron", {})
+    if not isinstance(neuron_raw, dict):
+        raise ValueError("`training_worker.neuron` must be a mapping")
+    neuron = NeuronDynamics(
+        dt=float(neuron_raw.get("dt", 1e-3)),
+        tau_soma=float(neuron_raw.get("tau_soma", 2e-2)),
+        tau_apical=float(neuron_raw.get("tau_apical", 3e-2)),
+        tau_basal=float(neuron_raw.get("tau_basal", 3e-2)),
+        coupling_apical=float(neuron_raw.get("coupling_apical", 0.6)),
+        coupling_basal=float(neuron_raw.get("coupling_basal", 0.6)),
+        threshold=float(neuron_raw.get("threshold", -0.054)),
+        v_rest=float(neuron_raw.get("v_rest", -0.07)),
+    )
+
     hyper_raw = worker_raw.get("hyperparams", {})
     if not isinstance(hyper_raw, dict):
         raise ValueError("`training_worker.hyperparams` must be a mapping")
@@ -211,8 +227,8 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         logit_scale_value = float(logit_raw.get("value", 1.0))
     else:
         logit_scale_value = float(logit_raw)
-    rate_lambda = float(hyper_raw.get("rate_reg_lambda", 0.0))
-    rate_target = float(hyper_raw.get("rate_target", 0.0))
+    rate_lambda = float(hyper_raw.get("rate_reg_lambda", 1e-3))
+    rate_target = float(hyper_raw.get("rate_target", 0.2))
     reg_block = hyper_raw.get("tstep_regularization")
     if isinstance(reg_block, dict):
         rate_lambda = float(reg_block.get("rate_reg_lambda", reg_block.get("lambda", rate_lambda)))
@@ -229,18 +245,32 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
     anderson_m_value = int(hyper_raw.get("anderson_m", 4))
     anderson_beta_value = float(hyper_raw.get("anderson_beta", 0.5))
     k_schedule_value = hyper_raw.get("K_schedule")
+    fp_tol_value = hyper_raw.get("tol")
     if isinstance(solver_block, dict):
         solver_value = str(solver_block.get("type") or solver_block.get("name") or solver_value).lower()
         anderson_m_value = int(solver_block.get("anderson_m", anderson_m_value))
         anderson_beta_value = float(solver_block.get("anderson_beta", anderson_beta_value))
         k_schedule_value = solver_block.get("K_schedule", solver_block.get("schedule", k_schedule_value))
+        if fp_tol_value is None:
+            fp_tol_value = solver_block.get("tol")
+    if fp_tol_value is None:
+        fp_tol_value = hyper_raw.get("fp_tolerance", 1e-5)
+    fp_tol_value = max(1e-9, float(fp_tol_value))
     warmup_steps_value = hyper_raw.get("warmup_steps")
     scheduler_block = hyper_raw.get("scheduler")
     if warmup_steps_value is None and isinstance(scheduler_block, dict):
         warmup_steps_value = scheduler_block.get("warmup_steps")
     warmup_steps_value = max(0, int(warmup_steps_value or 0))
     beta_start, beta_end = _parse_schedule(hyper_raw.get("beta"))
+    if beta_start is None and beta_end is None:
+        base_beta = float(neuron.beta)
+        beta_start = float(np.clip(base_beta * 1.05, 0.0, 1.0))
+        beta_end = float(np.clip(base_beta * 0.95, 0.0, 1.0))
     v_th_start, v_th_end = _parse_schedule(hyper_raw.get("v_th"))
+    if v_th_start is None and v_th_end is None:
+        base_threshold = float(neuron.threshold)
+        v_th_start = base_threshold + 1e-3
+        v_th_end = base_threshold - 1e-3
     contraction_rho = float(hyper_raw.get("contraction_rho", 0.9))
     contraction_lambda = float(hyper_raw.get("contraction_lambda", 0.0))
     if contraction_rho <= 0.0:
@@ -274,20 +304,7 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         v_th_end=v_th_end,
         contraction_rho=contraction_rho,
         contraction_lambda=contraction_lambda,
-    )
-
-    neuron_raw = worker_raw.get("neuron", {})
-    if not isinstance(neuron_raw, dict):
-        raise ValueError("`training_worker.neuron` must be a mapping")
-    neuron = NeuronDynamics(
-        dt=float(neuron_raw.get("dt", 1e-3)),
-        tau_soma=float(neuron_raw.get("tau_soma", 2e-2)),
-        tau_apical=float(neuron_raw.get("tau_apical", 3e-2)),
-        tau_basal=float(neuron_raw.get("tau_basal", 3e-2)),
-        coupling_apical=float(neuron_raw.get("coupling_apical", 0.6)),
-        coupling_basal=float(neuron_raw.get("coupling_basal", 0.6)),
-        threshold=float(neuron_raw.get("threshold", -0.054)),
-        v_rest=float(neuron_raw.get("v_rest", -0.07)),
+        fp_tolerance=fp_tol_value,
     )
 
     nats_raw = worker_raw.get("nats", {})
@@ -668,7 +685,7 @@ class Trainer:
         self.grad_clip = self.cfg.hyper.grad_clip if (self.cfg.hyper.grad_clip and self.cfg.hyper.grad_clip > 0) else None
         self.learnable_temperature = self.cfg.hyper.learnable_temperature
         self._temperature = max(1e-6, self.cfg.hyper.temperature)
-        self.solver = self.cfg.hyper.solver if self.cfg.mode == "fpt" else "plain"
+        self.solver = (self.cfg.hyper.solver or "plain").lower() if self.cfg.mode == "fpt" else "plain"
         self.anderson_m = max(1, self.cfg.hyper.anderson_m)
         self.anderson_beta = float(self.cfg.hyper.anderson_beta)
         self.K_schedule = self.cfg.hyper.K_schedule
@@ -688,6 +705,9 @@ class Trainer:
         self._spectral_rng = np.random.default_rng(self.cfg.hyper.seed)
         self._spectral_vec: Optional[np.ndarray] = None
         self._probe_interval = 1  # log every batch for quick diagnosis
+        self.fp_tolerance = max(1e-9, float(self.cfg.hyper.fp_tolerance))
+        self._active_truncation = max(1, self.cfg.hyper.truncation_steps)
+        self._k_schedule_mode, self._k_schedule_values = self._parse_k_schedule(self.K_schedule)
 
     @property
     def temperature(self) -> float:
@@ -718,6 +738,50 @@ class Trainer:
     def _interp(start: float, end: float, progress: float) -> float:
         progress_clamped = float(np.clip(progress, 0.0, 1.0))
         return start + (end - start) * progress_clamped
+
+    @staticmethod
+    def _parse_k_schedule(raw: Optional[str]) -> Tuple[Optional[str], Optional[List[int]]]:
+        if raw is None:
+            return None, None
+        text = str(raw).strip()
+        if not text:
+            return None, None
+        lowered = text.lower()
+        if lowered == "auto":
+            return "auto", None
+        tokens = re.split(r"[;,]+|\\s+", text)
+        values: List[int] = []
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                value = int(token)
+            except ValueError:
+                continue
+            if value > 0:
+                values.append(value)
+        if values:
+            return "list", values
+        return None, None
+
+    def refresh_truncation(self, epoch_index: int, total_epochs: int) -> None:
+        base = max(1, self.cfg.hyper.truncation_steps)
+        if self._k_schedule_mode == "auto":
+            if total_epochs <= 1:
+                self._active_truncation = base
+                return
+            progress = float(epoch_index) / max(total_epochs - 1, 1)
+            min_cap = max(1, base // 2)
+            value = base - (base - min_cap) * progress
+            self._active_truncation = max(1, int(round(value)))
+            return
+        if self._k_schedule_values:
+            bucket = max(1, math.ceil(total_epochs / len(self._k_schedule_values)))
+            index = min(len(self._k_schedule_values) - 1, epoch_index // bucket)
+            self._active_truncation = max(1, int(self._k_schedule_values[index]))
+            return
+        self._active_truncation = base
 
     def resolve_annealed_params(self, progress: float) -> Tuple[float, Optional[float], Optional[float]]:
         g_apical = float(self._interp(self.g_apical_start, self.g_apical_end, progress))
@@ -969,7 +1033,7 @@ class Trainer:
             if beta_override is not None
             else neuron.beta
         )
-        max_steps = max(1, self.cfg.hyper.truncation_steps)
+        max_steps = max(1, self._active_truncation)
         solver = self.solver
         anderson_depth = max(1, self.anderson_m)
         anderson_beta = np.clip(self.anderson_beta, 0.0, 1.0)
@@ -984,7 +1048,7 @@ class Trainer:
                 if iteration > 1:
                     delta = h_current - h_prev
                     residual_value = float(np.linalg.norm(delta) / np.sqrt(delta.size))
-                    if residual_value <= self.cfg.hyper.tol if hasattr(self.cfg.hyper, "tol") else False:
+                    if residual_value <= self.fp_tolerance:
                         iteration_used = iteration
                         break
                 h_prev = h_current.copy()
@@ -1031,8 +1095,7 @@ class Trainer:
                 h_mix = np.tensordot(coeffs, stacked_diff, axes=(0, 0)).reshape(h_prev.shape)
                 h_current = (1.0 - anderson_beta) * h_prev + anderson_beta * h_mix
                 iteration_used = iteration
-        else:
-            truncation = max_steps
+        truncation = max_steps
 
         grad_pre = grad_logits / temp_value
         grad_Wo = grad_pre.T @ scaled_state
@@ -1054,6 +1117,7 @@ class Trainer:
         steps = 0
         residual_accum = 0.0
         residual_count = 0
+        prev_step_residual: Optional[float] = None
         for idx in range(timesteps - 1, -1, -1):
             x_t = batch_x[:, idx, :]
             h_prev = h_list[idx]
@@ -1074,14 +1138,26 @@ class Trainer:
 
             if idx > 0:
                 delta = np.abs(h_list[idx] - h_list[idx - 1])
-                residual_accum += float(np.mean(delta))
+                step_residual = float(np.mean(delta))
+                residual_accum += step_residual
                 residual_count += 1
+                stop_due_to_tol = self.fp_tolerance > 0.0 and step_residual <= self.fp_tolerance
+                ratio_trigger = (
+                    prev_step_residual is not None
+                    and prev_step_residual > 0.0
+                    and (step_residual / max(prev_step_residual, 1e-9)) > 0.98
+                )
+                prev_step_residual = step_residual
+            else:
+                stop_due_to_tol = False
+                ratio_trigger = False
 
             steps += 1
-            if steps >= truncation:
+            if steps >= truncation or stop_due_to_tol or ratio_trigger:
                 break
 
         residual_value = residual_accum / residual_count if residual_count > 0 else 0.0
+        iteration_used = steps
         if contraction_lambda > 0.0:
             grad_Whh += 2.0 * contraction_lambda * self.model.Whh
 
@@ -1120,6 +1196,7 @@ class Trainer:
             spikes_total=total_spikes,
             spikes_per_neuron=per_neuron,
             residual=residual_value,
+            iterations=iteration_used,
             s_rate=s_rate,
             logit_mean=logit_mean,
             logit_std=logit_std,
@@ -1271,6 +1348,8 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
             else:
                 progress = epoch / max(1, epochs - 1)
             g_apical_value, beta_override, threshold_override = trainer.resolve_annealed_params(progress)
+            if worker_cfg.mode == "fpt":
+                trainer.refresh_truncation(epoch, epochs)
             for batch_x, batch_y in _batch_iterator(train_x, train_y, worker_cfg.hyper.batch_size):
                 step_start = time.perf_counter()
                 global_step += 1
@@ -1347,6 +1426,9 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                         metrics_payload["residual"] = result.residual
                     metrics_payload["s_rate"] = float(result.s_rate) if result.s_rate is not None else 0.0
                     metrics_payload["rate_target"] = trainer.rate_target
+                    metrics_payload["solver"] = trainer.solver
+                    if result.iterations is not None:
+                        metrics_payload["k"] = result.iterations
                     if result.logit_mean is not None:
                         metrics_payload["logit_mean"] = result.logit_mean
                     if result.logit_std is not None:
@@ -1460,7 +1542,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                     f"[epoch {epoch + 1}/{epochs}] mode={worker_cfg.mode} "
                     f"train_loss={train_avg_loss:.4f} train_acc={train_avg_acc:.4f} train_top5={train_avg_top5:.4f} "
                     f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_top5={val_top5:.4f} "
-                    f"conf={val_conf:.4f} entropy={val_entropy:.4f} rate={train_avg_rate:.3f}->{trainer.rate_target:.2f}"
+                    f"conf={val_conf:.4f} entropy={val_entropy:.4f} rate={train_avg_rate:.3f}→target={trainer.rate_target:.2f}"
                     + (f" residual={residual_mean:.6f}" if residual_mean is not None else "")
                     + (f" avg_throughput={avg_throughput:.2f}" if avg_throughput is not None else "")
                 ),

@@ -41,15 +41,23 @@ export interface MetricPayload {
   epoch: number;
   step: number;
   loss: number;
+  nll?: number;
   acc?: number;
   top5?: number;
+  conf?: number;
+  entropy?: number;
   ema_loss?: number;
   ema_acc?: number;
   throughput?: number;
   step_ms?: number;
   lr?: number;
+  logit_scale?: number;
+  logit_mean?: number;
+  logit_std?: number;
+  s_rate?: number;
   residual?: number;
   k?: number;
+  k_bin?: number;
   temperature?: number;
   examples?: number;
   best_acc?: number;
@@ -116,6 +124,13 @@ export interface TrainInitEvent {
   anderson_m?: number;
   anderson_beta?: number;
   K_schedule?: string | null;
+  temperature?: number;
+  logit_scale?: number;
+  logit_scale_learnable?: boolean;
+  steps_per_epoch?: number;
+  grad_clip?: number;
+  weight_decay?: number;
+  rate_target?: number;
   time_unix?: number;
 }
 
@@ -128,6 +143,8 @@ export interface TrainIterEvent {
   time_unix?: number;
   max_k?: number;
   solver?: string;
+  lr?: number;
+  k_bin?: number;
 }
 
 export interface UISysLogEvent {

@@ -70,6 +70,8 @@ docker compose up -d
 
 参考类型定义：`ui-vue/src/types.ts`。
 
+默认训练配置将 `steps_per_epoch` 设为 ≥128，用于在小数据集上重复采样 batch，同时在前向最后一步按 `logit_scale=1.25` 放大 logits。可通过 `training_service.steps_per_epoch` 与 `training_service.logit_scale` 调整，事件流会在 `train_init` / `metrics_*` 中上报这两个数值，便于 UI 同步显示。
+
 ### 5.3 启动前端 UI
 
 ```bash
@@ -96,7 +98,7 @@ npm run dev
 - `train_init` → `TrainInitEvent`：初始化训练参数，字段包括 `dataset`、`epochs`、`fixed_point_K`、`fixed_point_tol`、`timesteps`、`hidden`、`layers`、`lr`。
 - `train_status` → `{ status: TrainingStatus }`：广播 `Idle` / `Initializing` / `Training` / `Stopped` / `Error`。
 - `train_iter` → `TrainIterEvent`：固定点残差进度，携带 `epoch`、`step`、`k`、`max_k`、`layer`、`residual`、`solver` 等（便于 UI 展示 Anderson 混合步数和迭代上限）。
-- `metrics_batch` / `metrics_epoch` → `MetricPayload`：分别代表批次指标与 epoch 汇总，字段覆盖 `loss`、`acc`、`top5`、`throughput`、`step_ms`、`ema_loss`、`ema_acc`、`lr`、`temperature`、`residual`、`k`、`examples`、`best_acc`、`best_loss`、`avg_throughput`、`epoch_sec`。
+- `metrics_batch` / `metrics_epoch` → `MetricPayload`：分别代表批次指标与 epoch 汇总，字段覆盖 `loss/nll`、`conf`、`entropy`、`acc`、`top5`、`throughput`、`step_ms`、`ema_loss`、`ema_acc`、`lr`、`temperature`、`s_rate`、`logit_scale/logit_mean/logit_std`、`residual`、`k`/`k_bin`、`examples`、`best_acc`、`best_loss`、`avg_throughput`、`epoch_sec`。
 - `spike` → `SpikePayload`：实时脉冲，可选 `edges` 与功率 `power`。
 - `log` → `UISysLogEvent` 或 `LogPayload`：用于 UI 控制台和 Toast，需提供 `level`、`msg` / `message`。
 - `dataset_download` → `DatasetDownloadEvent`：三态状态机：`start`、`progress`、`complete`（如失败可回传 `error` 并附带 `message`）。
