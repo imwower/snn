@@ -33,6 +33,14 @@ training_worker:
     truncation_steps: 4
     timesteps: 16
     seed: 42
+    solver: anderson
+    anderson_m: 4
+    anderson_beta: 0.5
+    warmup_steps: 100
+    grad_clip: 1.0
+    temperature: 1.0
+    temperature_learnable: false
+    K_schedule: null
   neuron:
     dt: 0.001
     tau_soma: 0.02

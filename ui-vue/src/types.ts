@@ -117,6 +117,8 @@ export interface TrainIterEvent {
   layer?: number;
   residual?: number;
   time_unix?: number;
+  max_k?: number;
+  solver?: string;
 }
 
 export interface UISysLogEvent {
