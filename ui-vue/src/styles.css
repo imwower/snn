@@ -228,8 +228,8 @@ legend {
 }
 
 .status-core {
-  background: rgba(21, 36, 58, 0.78);
-  border: 1px solid rgba(148, 163, 184, 0.15);
+  background: rgba(21, 36, 58, 0.56);
+  border: 1px solid rgba(148, 163, 184, 0.12);
   border-radius: 14px;
   display: flex;
   align-items: flex-start;
@@ -237,7 +237,8 @@ legend {
   gap: 16px;
   padding: 8px 18px;
   font-size: 0.85rem;
-  backdrop-filter: blur(4px);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 16px 30px rgba(15, 23, 42, 0.18);
 }
 
 .status-bar.expanded {
@@ -270,7 +271,7 @@ legend {
   padding: 4px 10px;
   border-radius: 999px;
   border: 1px solid rgba(148, 163, 184, 0.18);
-  background: rgba(148, 163, 184, 0.12);
+  background: rgba(148, 163, 184, 0.08);
   color: var(--text-secondary);
   font-size: 0.72rem;
   font-variant-numeric: tabular-nums;
@@ -288,16 +289,16 @@ legend {
 .status-core .logs-toggle {
   font-size: 0.75rem;
   padding: 6px 10px;
-  background: rgba(148, 163, 184, 0.1);
+  background: rgba(148, 163, 184, 0.08);
   color: var(--text-primary);
-  border: 1px solid rgba(148, 163, 184, 0.2);
+  border: 1px solid rgba(148, 163, 184, 0.18);
   border-radius: 999px;
   transition: background 0.2s ease, border-color 0.2s ease;
 }
 
 .status-core .logs-toggle:hover {
-  background: rgba(148, 163, 184, 0.18);
-  border-color: rgba(148, 163, 184, 0.35);
+  background: rgba(148, 163, 184, 0.14);
+  border-color: rgba(148, 163, 184, 0.3);
 }
 
 .status-badge {
@@ -306,17 +307,17 @@ legend {
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  background: rgba(59, 130, 246, 0.2);
+  background: rgba(59, 130, 246, 0.14);
   color: var(--accent);
 }
 
 .status-badge.status-training {
-  background: rgba(94, 240, 193, 0.18);
+  background: rgba(94, 240, 193, 0.14);
   color: var(--accent-strong);
 }
 
 .status-badge.status-idle {
-  background: rgba(76, 201, 240, 0.12);
+  background: rgba(76, 201, 240, 0.1);
 }
 
 .status-badge.status-initializing {
@@ -370,13 +371,14 @@ canvas {
 }
 
 .status-bar-wrapper .logs-container {
-  background: rgba(20, 33, 54, 0.7);
-  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(20, 33, 54, 0.3);
+  border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 12px;
   overflow: hidden;
-  max-height: 200px;
-  backdrop-filter: blur(4px);
-  box-shadow: 0 18px 36px rgba(15, 23, 42, 0.25);
+  max-height: 240px;
+  padding: 10px;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 18px 36px rgba(15, 23, 42, 0.16);
 }
 
 .logs-expand-enter-active,
@@ -392,23 +394,27 @@ canvas {
 
 .logs-expand-enter-to,
 .logs-expand-leave-from {
-  max-height: 200px;
+  max-height: 240px;
   opacity: 1;
 }
 
 .logs-panel {
-  max-height: var(--logs-panel-height, 150px);
+  max-height: var(--logs-panel-height, 190px);
   overflow-y: auto;
-  background: rgba(20, 33, 54, 0.4);
+  background: rgba(15, 23, 42, 0.45);
   border: 1px solid rgba(148, 163, 184, 0.18);
   border-radius: 8px;
-  padding: 10px 12px;
+  padding: 12px 14px 20px;
   display: flex;
   flex-direction: column;
   gap: 6px;
   font-family: 'JetBrains Mono', 'Fira Mono', ui-monospace, SFMono-Regular, 'SFMono-Regular', Menlo, Monaco,
     Consolas, 'Liberation Mono', 'Courier New', monospace;
   font-size: 0.78rem;
+  backdrop-filter: blur(8px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  scroll-padding-bottom: 18px;
+  scrollbar-gutter: stable both-edges;
 }
 
 .logs-overlay-enter-active,

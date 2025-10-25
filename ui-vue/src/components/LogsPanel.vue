@@ -47,14 +47,26 @@ watch(
 
 <style scoped>
 .logs-panel {
-  max-height: 220px;
+  max-height: var(--logs-panel-height, 190px);
   overflow-y: auto;
   font-family: 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
   font-size: 12px;
-  padding: 8px 10px;
-  background-color: rgba(18, 18, 18, 0.85);
+  padding: 12px 14px 20px;
+  background-color: rgba(15, 23, 42, 0.45);
   color: #f5f5f5;
-  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 18px 36px rgba(15, 23, 42, 0.18);
+  scroll-padding-bottom: 18px;
+  scrollbar-gutter: stable both-edges;
+}
+
+.logs-panel::after {
+  content: '';
+  display: block;
+  height: 6px;
+  flex: 0 0 auto;
 }
 
 .log-line {
