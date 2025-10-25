@@ -173,7 +173,11 @@ watch(
     store.cfg.K,
     store.cfg.tol,
     store.cfg.T,
-    store.cfg.epochs
+    store.cfg.epochs,
+    store.cfg.solver,
+    store.cfg.anderson_m,
+    store.cfg.anderson_beta,
+    store.cfg.K_schedule
   ],
   () => {
     hasInitialized.value = false;
@@ -248,7 +252,11 @@ const initTraining = () =>
         K: store.cfg.K,
         tol: store.cfg.tol,
         T: store.cfg.T,
-        epochs: store.cfg.epochs
+        epochs: store.cfg.epochs,
+        solver: store.cfg.solver,
+        anderson_m: store.cfg.anderson_m,
+        anderson_beta: store.cfg.anderson_beta,
+        K_schedule: store.cfg.K_schedule
       });
       store.setStatus('Idle');
       store.pushPlainLog(`训练初始化完成：${store.cfg.dataset}`, 'INFO');

@@ -33,7 +33,11 @@ const defaultConfig = (): TrainingConfig => ({
   K: 4,
   tol: 1e-5,
   T: 12,
-  epochs: 20
+  epochs: 20,
+  solver: 'anderson',
+  anderson_m: 4,
+  anderson_beta: 0.5,
+  K_schedule: 'auto'
 });
 
 const defaultBatchSnapshot = () => ({
@@ -167,6 +171,16 @@ export const useUiStore = defineStore('ui', {
         next.epochs = Math.max(1, Math.round(next.epochs));
       } else {
         next.epochs = current.epochs;
+      }
+      next.solver = next.solver === 'anderson' ? 'anderson' : 'plain';
+      const mValue = Number(next.anderson_m ?? current.anderson_m ?? 4);
+      next.anderson_m = Math.max(1, Math.round(Number.isFinite(mValue) ? mValue : (current.anderson_m ?? 4)));
+      const betaValue = Number(next.anderson_beta ?? current.anderson_beta ?? 0.5);
+      next.anderson_beta = Number.isFinite(betaValue)
+        ? Math.min(1, Math.max(0, betaValue))
+        : (current.anderson_beta ?? 0.5);
+      if (typeof next.K_schedule !== 'string' || !next.K_schedule.trim()) {
+        next.K_schedule = current.K_schedule ?? null;
       }
       this.cfg = next;
       this.layersLayout = buildLayout(next);

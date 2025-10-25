@@ -33,6 +33,19 @@ training_worker:
     truncation_steps: 4
     timesteps: 16
     seed: 42
+    warmup_steps: 100
+    grad_clip: 1.0
+    temperature: 1.0
+    temperature_learnable: false
+    solver: anderson
+    anderson_m: 4
+    anderson_beta: 0.5
+    K_schedule: auto
+    rate_reg_lambda: 0.0
+    rate_target: 0.1
+    g_apical:
+      start: 0.5
+      end: 0.2
     solver: anderson
     anderson_m: 4
     anderson_beta: 0.5

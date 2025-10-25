@@ -70,6 +70,10 @@ class HyperParams:
     anderson_m: int = 4
     anderson_beta: float = 0.5
     K_schedule: Optional[str] = None
+    rate_reg_lambda: float = 0.0
+    rate_target: float = 0.0
+    g_apical_start: float = 0.5
+    g_apical_end: float = 0.2
 
 
 @dataclass(frozen=True)
@@ -177,6 +181,15 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
     grad_clip_value = float(grad_clip_raw) if grad_clip_raw is not None else None
     if grad_clip_value is not None and grad_clip_value <= 0:
         grad_clip_value = None
+    rate_lambda = float(hyper_raw.get("rate_reg_lambda", 0.0))
+    rate_target = float(hyper_raw.get("rate_target", 0.0))
+    g_apical_raw = hyper_raw.get("g_apical", {"start": 0.5, "end": 0.2})
+    if isinstance(g_apical_raw, dict):
+        g_apical_start = float(g_apical_raw.get("start", 0.5))
+        g_apical_end = float(g_apical_raw.get("end", 0.2))
+    else:
+        g_apical_start = float(g_apical_raw)
+        g_apical_end = float(hyper_raw.get("g_apical_end", g_apical_start))
 
     hyper = HyperParams(
         epochs=int(hyper_raw.get("epochs", 1)),
@@ -194,6 +207,10 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         anderson_m=int(hyper_raw.get("anderson_m", 4)),
         anderson_beta=float(hyper_raw.get("anderson_beta", 0.5)),
         K_schedule=hyper_raw.get("K_schedule"),
+        rate_reg_lambda=max(0.0, rate_lambda),
+        rate_target=rate_target,
+        g_apical_start=g_apical_start,
+        g_apical_end=g_apical_end,
     )
 
     neuron_raw = worker_raw.get("neuron", {})
@@ -472,7 +489,9 @@ class ThreeCompartmentModel:
         self.neuron = neuron
 
     def forward(
-        self, inputs: np.ndarray
+        self,
+        inputs: np.ndarray,
+        apical_coupling_override: Optional[float] = None,
     ) -> Tuple[np.ndarray, List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
         """Execute forward pass across full sequence.
 
@@ -491,6 +510,11 @@ class ThreeCompartmentModel:
         alpha = neuron.alpha
         beta = neuron.beta
         gamma = neuron.gamma
+        coupling_apical = (
+            float(apical_coupling_override)
+            if apical_coupling_override is not None
+            else neuron.coupling_apical
+        )
 
         h = np.full((batch, hidden), neuron.v_rest, dtype=np.float64)
         basal = np.full_like(h, neuron.v_rest)
@@ -508,7 +532,7 @@ class ThreeCompartmentModel:
             basal = (1.0 - beta) * basal + beta * z_t
             apical = (1.0 - gamma) * apical + gamma * h
             h = (1.0 - alpha) * h + alpha * (
-                neuron.coupling_apical * apical + neuron.coupling_basal * basal + z_t
+                coupling_apical * apical + neuron.coupling_basal * basal + z_t
             )
 
             spike_mask = h >= neuron.threshold
@@ -546,6 +570,7 @@ class TrainStepResult:
     spikes_per_neuron: List[int]
     residual: Optional[float] = None
     iterations: Optional[int] = None
+    s_rate: Optional[float] = None
 
 
 class Trainer:
@@ -560,19 +585,28 @@ class Trainer:
         self.anderson_m = max(1, self.cfg.hyper.anderson_m)
         self.anderson_beta = float(self.cfg.hyper.anderson_beta)
         self.K_schedule = self.cfg.hyper.K_schedule
+        self.rate_reg_lambda = max(0.0, self.cfg.hyper.rate_reg_lambda)
+        self.rate_target = float(self.cfg.hyper.rate_target)
+        self.g_apical_start = float(self.cfg.hyper.g_apical_start)
+        self.g_apical_end = float(self.cfg.hyper.g_apical_end)
 
     @property
     def temperature(self) -> float:
         return float(self._temperature)
 
-    def _forward_batch(self, batch_x: np.ndarray) -> Tuple[
+    def _forward_batch(
+        self,
+        batch_x: np.ndarray,
+        *,
+        apical_coupling_override: Optional[float] = None,
+    ) -> Tuple[
         np.ndarray,
         List[np.ndarray],
         List[np.ndarray],
         List[np.ndarray],
         List[np.ndarray],
     ]:
-        return self.model.forward(batch_x)
+        return self.model.forward(batch_x, apical_coupling_override)
 
     @staticmethod
     def _mean_soma_states(h_list: List[np.ndarray]) -> np.ndarray:
@@ -581,21 +615,42 @@ class Trainer:
         soma_stack = np.stack(h_list[1:], axis=0)
         return np.mean(soma_stack, axis=0)
 
-    def _train_step_tstep(self, batch_x: np.ndarray, batch_y: np.ndarray, lr: float) -> TrainStepResult:
+    def _train_step_tstep(
+        self,
+        batch_x: np.ndarray,
+        batch_y: np.ndarray,
+        lr: float,
+        apical_coupling: Optional[float] = None,
+    ) -> TrainStepResult:
         num_classes = self.model.network.output_dim
-        assert batch_y.dtype == np.int64, "labels must be int64"
+        if batch_y.dtype != np.int64:
+            raise ValueError("labels must be int64")
         if batch_y.size > 0:
-            assert int(batch_y.min()) >= 0 and int(batch_y.max()) < num_classes, "labels out of range"
+            y_min = int(batch_y.min())
+            y_max = int(batch_y.max())
+            if y_min < 0 or y_max >= num_classes:
+                raise ValueError(f"labels out of range [{y_min}, {y_max}) for {num_classes} classes")
 
-        _, h_list, _, _, spikes = self._forward_batch(batch_x)
+        _, h_list, _, _, spikes = self._forward_batch(batch_x, apical_coupling_override=apical_coupling)
         features = self._mean_soma_states(h_list)
         pre_logits = features @ self.model.Wo.T + self.model.bo
         temp_value = self.temperature
         logits = pre_logits / temp_value
-        assert logits.shape[1] == num_classes, "logit dimension mismatch"
+        if logits.ndim != 2 or logits.shape[1] != num_classes:
+            raise ValueError(f"logits must be (batch,{num_classes}), got {logits.shape}")
 
         loss, log_probs = nll_from_logits(logits, batch_y)
         probs, acc, top5, confidence, entropy = probabilities_and_stats(log_probs, batch_y)
+        row_sums = np.sum(probs, axis=1)
+        if not np.all(np.isfinite(row_sums)) or np.max(np.abs(row_sums - 1.0)) > 1e-4:
+            raise ValueError("probabilities must sum to 1 per row")
+        preds = np.argmax(probs, axis=1)
+        if preds.shape != batch_y.shape:
+            raise ValueError("predictions shape mismatch")
+        s_rate = float(np.mean(features)) if features.size else 0.0
+        if self.rate_reg_lambda > 0.0:
+            rate_error = s_rate - self.rate_target
+            loss += self.rate_reg_lambda * (rate_error ** 2)
 
         grad_logits = probs
         if batch_y.size:
@@ -633,6 +688,7 @@ class Trainer:
             entropy=entropy,
             spikes_total=total_spikes,
             spikes_per_neuron=per_neuron,
+            s_rate=s_rate,
         )
 
     def _train_step_fpt(self, batch_x: np.ndarray, batch_y: np.ndarray, lr: float) -> TrainStepResult:
@@ -842,9 +898,16 @@ class Trainer:
             total_entropy / denom,
         )
 
-    def train_batch(self, batch_x: np.ndarray, batch_y: np.ndarray, lr: float) -> TrainStepResult:
+    def train_batch(
+        self,
+        batch_x: np.ndarray,
+        batch_y: np.ndarray,
+        lr: float,
+        *,
+        apical_coupling: Optional[float] = None,
+    ) -> TrainStepResult:
         if self.cfg.mode == "tstep":
-            return self._train_step_tstep(batch_x, batch_y, lr)
+            return self._train_step_tstep(batch_x, batch_y, lr, apical_coupling)
         return self._train_step_fpt(batch_x, batch_y, lr)
 
 
@@ -888,6 +951,17 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
             epoch_examples = 0
             epoch_throughputs: List[float] = []
             epoch_residuals: List[float] = []
+            if worker_cfg.mode == "tstep":
+                if epochs <= 1:
+                    g_apical_value = trainer.g_apical_end
+                else:
+                    progress = (epoch - 1) / max(1, epochs - 1)
+                    g_apical_value = trainer.g_apical_start + (
+                        trainer.g_apical_end - trainer.g_apical_start
+                    ) * progress
+                g_apical_value = float(g_apical_value)
+            else:
+                g_apical_value = None
             for batch_x, batch_y in _batch_iterator(train_x, train_y, worker_cfg.hyper.batch_size):
                 step_start = time.perf_counter()
                 global_step += 1
@@ -898,7 +972,23 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                     total_steps,
                 )
                 last_lr = current_lr
-                result = trainer.train_batch(batch_x, batch_y, current_lr)
+                try:
+                    result = trainer.train_batch(
+                        batch_x,
+                        batch_y,
+                        current_lr,
+                        apical_coupling=g_apical_value,
+                    )
+                except AssertionError as exc:
+                    await publisher.publish_json(
+                        worker_cfg.nats.subjects.logs,
+                        {
+                            "level": "ERROR",
+                            "msg": f"[TSTEP] epoch={epoch} step={step + 1} failed: {exc}",
+                            "time_unix": current_millis(),
+                        },
+                    )
+                    break
                 step_duration = max(time.perf_counter() - step_start, 1e-6)
                 batch_size = batch_x.shape[0]
                 epoch_loss += result.loss * batch_size
@@ -933,6 +1023,8 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                     }
                     if result.residual is not None:
                         metrics_payload["residual"] = result.residual
+                    if result.s_rate is not None:
+                        metrics_payload["s_rate"] = result.s_rate
                     spikes_payload = {
                         "epoch": epoch + 1,
                         "step": global_step,

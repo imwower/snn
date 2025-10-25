@@ -58,6 +58,10 @@ class TrainingInitRequest(BaseModel):
     tol: float = Field(gt=0.0, description="固定点容差")
     T: Optional[int] = Field(default=None, description="时间步长（tstep 模式）")
     epochs: int = Field(ge=1, description="训练轮次")
+    solver: str = Field(default="plain", description="固定点求解器：plain 或 anderson")
+    anderson_m: int = Field(default=4, ge=1, description="Anderson 深度")
+    anderson_beta: float = Field(default=0.5, ge=0.0, le=1.0, description="Anderson 阻尼")
+    K_schedule: Optional[str] = Field(default=None, description="可选的 K 调度策略（如 auto）")
 
 
 class DatasetDownloadRequest(BaseModel):
@@ -773,6 +777,10 @@ class TrainingService:
             "tol": 1e-5,
             "T": 12,
             "epochs": 20,
+            "solver": "plain",
+            "anderson_m": 4,
+            "anderson_beta": 0.5,
+            "K_schedule": None,
         }
         self._task: Optional[asyncio.Task[None]] = None
         self._stop_event = asyncio.Event()
@@ -844,6 +852,10 @@ class TrainingService:
                 "timesteps": payload.T,
                 "fixed_point_K": payload.K,
                 "fixed_point_tol": payload.tol,
+                "solver": payload.solver,
+                "anderson_m": payload.anderson_m,
+                "anderson_beta": payload.anderson_beta,
+                "K_schedule": payload.K_schedule,
                 "hidden": payload.network_size,
                 "layers": payload.layers,
                 "lr": payload.lr,
@@ -900,10 +912,46 @@ class TrainingService:
             return
 
         timesteps = int(config.get("T") or 12)
-        iterations = max(1, int(config.get("K", 3)))
+        base_iterations = max(1, int(config.get("K", 3)))
         tolerance = float(config.get("tol", 1e-5))
-        fp_config = FixedPointConfig(iterations=iterations, tolerance=tolerance)
-        kernel = self._get_basal_kernel(timesteps, iterations, tolerance, self._params.dt, fp_config)
+        solver = str(config.get("solver", "plain")).lower()
+        anderson_m = max(1, int(config.get("anderson_m", 4)))
+        anderson_beta = float(config.get("anderson_beta", 0.5))
+        k_schedule = str(config.get("K_schedule", "") or "").lower()
+        adaptive_k = k_schedule == "auto"
+        current_iterations = base_iterations if not adaptive_k else max(1, min(base_iterations, 2))
+        fp_kernel_config = FixedPointConfig(
+            iterations=base_iterations,
+            tolerance=tolerance,
+            solver=solver,
+            anderson_m=anderson_m,
+            anderson_beta=anderson_beta,
+        )
+        kernel = self._get_basal_kernel(timesteps, base_iterations, tolerance, self._params.dt, fp_kernel_config)
+        await self._emit_log(
+            "INFO",
+            (
+                "using solver=%s K=%d T=%d temp=%s rate_reg=%s warmup=%s grad_clip=%s"
+                % (
+                    solver,
+                    base_iterations,
+                    timesteps,
+                    config.get("temperature", "n/a"),
+                    config.get("rate_reg_lambda", "0"),
+                    config.get("warmup_steps", 0),
+                    config.get("grad_clip", 0),
+                )
+            ),
+            metric={
+                "solver": solver,
+                "K": base_iterations,
+                "T": timesteps,
+                "temperature": config.get("temperature"),
+                "rate_reg_lambda": config.get("rate_reg_lambda"),
+                "warmup_steps": config.get("warmup_steps"),
+                "grad_clip": config.get("grad_clip"),
+            },
+        )
 
         num_classes = dataset.num_classes
         train_shape = dataset.train_x.shape
@@ -1033,7 +1081,14 @@ class TrainingService:
                     ema_loss = loss if ema_loss is None else ema_decay * ema_loss + (1 - ema_decay) * loss
                     ema_acc = batch_acc if ema_acc is None else ema_decay * ema_acc + (1 - ema_decay) * batch_acc
 
-                    residual_value, spike_payload = self._build_iteration_events(
+                    batch_fp_config = FixedPointConfig(
+                        iterations=current_iterations,
+                        tolerance=tolerance,
+                        solver=solver,
+                        anderson_m=anderson_m,
+                        anderson_beta=anderson_beta,
+                    )
+                    residual_value, actual_iters, spike_payload = self._build_iteration_events(
                         model,
                         batch_x,
                         batch_y,
@@ -1042,11 +1097,16 @@ class TrainingService:
                         step,
                         layers_count,
                         timesteps,
-                        fp_config,
+                        batch_fp_config,
                     )
 
                     if use_residual_metric and batch_size_actual > 0:
                         epoch_residuals.append(residual_value)
+                    if adaptive_k and use_residual_metric:
+                        if residual_value > tolerance and current_iterations < base_iterations:
+                            current_iterations += 1
+                        elif residual_value < tolerance * 0.25 and current_iterations > 1:
+                            current_iterations -= 1
 
                     metrics_payload = {
                         "epoch": epoch,
@@ -1059,15 +1119,19 @@ class TrainingService:
                         "ema_loss": ema_loss,
                         "ema_acc": ema_acc,
                         "lr": lr,
+                        "residual": residual_value,
+                        "k": actual_iters,
                         "examples": int(batch_x.shape[0]),
                         "time_unix": _current_millis(),
                     }
                     iter_payload = {
                         "epoch": epoch,
                         "step": step + 1,
-                        "k": iterations,
+                        "k": actual_iters,
+                        "max_k": base_iterations,
                         "layer": step % layers_count,
                         "residual": residual_value,
+                        "solver": solver,
                         "time_unix": _current_millis(),
                     }
 
@@ -1190,7 +1254,15 @@ class TrainingService:
         dt: float,
         config: FixedPointConfig,
     ) -> np.ndarray:
-        key = (timesteps, iterations, tolerance, dt)
+        key = (
+            timesteps,
+            iterations,
+            tolerance,
+            dt,
+            config.solver,
+            config.anderson_m,
+            config.anderson_beta,
+        )
         kernel = self._kernel_cache.get(key)
         if kernel is None:
             kernel = _compute_basal_kernel(self._params, timesteps, config)
@@ -1336,9 +1408,9 @@ class TrainingService:
         layers_count: int,
         timesteps: int,
         fp_config: FixedPointConfig,
-    ) -> Tuple[float, Optional[Dict[str, Any]]]:
+    ) -> Tuple[float, int, Optional[Dict[str, Any]]]:
         if inputs.shape[0] == 0:
-            return 0.0, None
+            return 0.0, 0, None
         sample_idx = 0
         class_idx = int(labels[sample_idx]) if labels.size > 0 else 0
         class_idx = max(0, min(class_idx, model.W_basal.shape[0] - 1))
@@ -1350,6 +1422,7 @@ class TrainingService:
             config=fp_config,
         )
         residual = result.residuals[-1] if result.residuals else 0.0
+        iterations_used = len(result.residuals)
         spike_payload: Optional[Dict[str, Any]] = None
         if result.states:
             spikes = [idx for idx, state in enumerate(result.states) if state.spike]
@@ -1369,7 +1442,7 @@ class TrainingService:
                 "apical_trace": apical_trace,
                 "basal_trace": basal_trace,
             }
-        return float(residual), spike_payload
+        return float(residual), iterations_used, spike_payload
 
     def _evaluate(
         self,

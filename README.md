@@ -95,8 +95,8 @@ npm run dev
 
 - `train_init` → `TrainInitEvent`：初始化训练参数，字段包括 `dataset`、`epochs`、`fixed_point_K`、`fixed_point_tol`、`timesteps`、`hidden`、`layers`、`lr`。
 - `train_status` → `{ status: TrainingStatus }`：广播 `Idle` / `Initializing` / `Training` / `Stopped` / `Error`。
-- `train_iter` → `TrainIterEvent`：固定点残差进度，携带 `epoch`、`step`、`k`、`layer`、`residual` 等（例如 anderson solver 的混合步数、最大迭代数等）。
-- `metrics_batch` / `metrics_epoch` → `MetricPayload`：分别代表批次指标与 epoch 汇总，字段覆盖 `loss`、`acc`、`top5`、`throughput`、`step_ms`、`ema_loss`、`ema_acc`、`lr`、`examples`、`best_acc`、`best_loss`、`avg_throughput`、`epoch_sec`。
+- `train_iter` → `TrainIterEvent`：固定点残差进度，携带 `epoch`、`step`、`k`、`max_k`、`layer`、`residual`、`solver` 等（便于 UI 展示 Anderson 混合步数和迭代上限）。
+- `metrics_batch` / `metrics_epoch` → `MetricPayload`：分别代表批次指标与 epoch 汇总，字段覆盖 `loss`、`acc`、`top5`、`throughput`、`step_ms`、`ema_loss`、`ema_acc`、`lr`、`temperature`、`residual`、`k`、`examples`、`best_acc`、`best_loss`、`avg_throughput`、`epoch_sec`。
 - `spike` → `SpikePayload`：实时脉冲，可选 `edges` 与功率 `power`。
 - `log` → `UISysLogEvent` 或 `LogPayload`：用于 UI 控制台和 Toast，需提供 `level`、`msg` / `message`。
 - `dataset_download` → `DatasetDownloadEvent`：三态状态机：`start`、`progress`、`complete`（如失败可回传 `error` 并附带 `message`）。

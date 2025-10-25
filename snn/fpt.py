@@ -8,8 +8,11 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Deque, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from .neuron import CompartmentState, ThreeCompartmentParams
 
@@ -23,6 +26,9 @@ class FixedPointConfig:
     iterations: int = 3
     tolerance: float = 1e-6
     damping: float = 1.0
+    solver: str = "plain"
+    anderson_m: int = 4
+    anderson_beta: float = 0.5
 
 
 @dataclass
@@ -45,6 +51,40 @@ def _initial_vector(length: int, value: float) -> List[float]:
     """构造长度一致的初始向量。"""
 
     return [float(value) for _ in range(length)]
+
+
+def _apply_damped_update(prev: np.ndarray, candidate: np.ndarray, damping: float) -> np.ndarray:
+    return (1.0 - damping) * prev + damping * candidate
+
+
+def _anderson_mix(
+    prev: np.ndarray,
+    state_history: Sequence[np.ndarray],
+    residual_history: Sequence[np.ndarray],
+    beta: float,
+    damping: float,
+) -> np.ndarray:
+    if len(state_history) < 2:
+        return _apply_damped_update(prev, state_history[-1], damping)
+    stacked_res = np.stack(residual_history, axis=1)  # (dim, m)
+    m = stacked_res.shape[1]
+    gram = stacked_res.T @ stacked_res
+    ones = np.ones((m, 1), dtype=np.float64)
+    system = np.block([[gram, ones], [ones.T, np.zeros((1, 1), dtype=np.float64)]])
+    rhs = np.zeros(m + 1, dtype=np.float64)
+    rhs[-1] = 1.0
+    try:
+        solution = np.linalg.solve(system + 1e-10 * np.eye(m + 1, dtype=np.float64), rhs)
+    except np.linalg.LinAlgError:
+        return _apply_damped_update(prev, state_history[-1], damping)
+    coeffs = solution[:m]
+    if not np.all(np.isfinite(coeffs)):
+        return _apply_damped_update(prev, state_history[-1], damping)
+    mixed = np.zeros_like(prev)
+    for weight, state in zip(coeffs, state_history):
+        mixed += weight * state
+    beta_clamped = float(np.clip(beta, 0.0, 1.0))
+    return (1.0 - beta_clamped) * prev + beta_clamped * mixed
 
 
 def fixed_point_parallel_solve(
@@ -105,6 +145,11 @@ def fixed_point_parallel_solve(
 
     dt = params.dt
     damping = config.damping
+    solver_name = (config.solver or "plain").lower()
+    use_anderson = solver_name == "anderson"
+    history_states: Deque[np.ndarray] = deque(maxlen=max(1, config.anderson_m))
+    history_residuals: Deque[np.ndarray] = deque(maxlen=max(1, config.anderson_m))
+    beta_mix = float(np.clip(config.anderson_beta, 0.0, 1.0))
 
     logger.info(
         "固定点迭代开始：步数=%d, 迭代次数=%d, 阈值=%.2e, 阻尼=%.2f",
@@ -153,13 +198,32 @@ def fixed_point_parallel_solve(
         for idx in range(steps):
             apical_state[idx] = (1.0 - damping) * prev_apical[idx] + damping * apical_candidate[idx]
             basal_state[idx] = (1.0 - damping) * prev_basal[idx] + damping * basal_candidate[idx]
-            soma[idx] = (1.0 - damping) * prev_soma[idx] + damping * soma_candidate[idx]
 
-        residual = max(
-            max(abs(soma[idx] - prev_soma[idx]) for idx in range(steps)),
-            max(abs(apical_state[idx] - prev_apical[idx]) for idx in range(steps)),
-            max(abs(basal_state[idx] - prev_basal[idx]) for idx in range(steps)),
+        prev_soma_arr = np.asarray(prev_soma, dtype=np.float64)
+        soma_candidate_arr = np.asarray(soma_candidate, dtype=np.float64)
+        if use_anderson:
+            residual_vec = soma_candidate_arr - prev_soma_arr
+            history_states.append(soma_candidate_arr.copy())
+            history_residuals.append(residual_vec.copy())
+            updated_soma_arr = _anderson_mix(
+                prev_soma_arr,
+                list(history_states),
+                list(history_residuals),
+                beta_mix,
+                damping,
+            )
+        else:
+            updated_soma_arr = _apply_damped_update(prev_soma_arr, soma_candidate_arr, damping)
+        soma = updated_soma_arr.tolist()
+
+        soma_diff = float(np.max(np.abs(updated_soma_arr - prev_soma_arr)))
+        apical_diff = float(
+            np.max(np.abs(np.asarray(apical_state, dtype=np.float64) - np.asarray(prev_apical, dtype=np.float64)))
         )
+        basal_diff = float(
+            np.max(np.abs(np.asarray(basal_state, dtype=np.float64) - np.asarray(prev_basal, dtype=np.float64)))
+        )
+        residual = max(soma_diff, apical_diff, basal_diff)
         residuals.append(residual)
         logger.info("迭代 %d/%d，残差=%.3e", iteration, config.iterations, residual)
 

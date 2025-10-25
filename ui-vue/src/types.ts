@@ -31,6 +31,10 @@ export interface TrainingConfig {
   tol: number;
   T?: number;
   epochs: number;
+  solver?: 'plain' | 'anderson';
+  anderson_m?: number;
+  anderson_beta?: number;
+  K_schedule?: string | null;
 }
 
 export interface MetricPayload {
@@ -46,6 +50,7 @@ export interface MetricPayload {
   lr?: number;
   residual?: number;
   k?: number;
+  temperature?: number;
   examples?: number;
   best_acc?: number;
   best_loss?: number;
@@ -107,6 +112,10 @@ export interface TrainInitEvent {
   hidden?: number;
   layers?: number;
   lr?: number;
+  solver?: string;
+  anderson_m?: number;
+  anderson_beta?: number;
+  K_schedule?: string | null;
   time_unix?: number;
 }
 
