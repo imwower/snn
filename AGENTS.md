@@ -5,6 +5,7 @@
 - Python regression tests sit under `tests/` and follow the `test_*.py` pattern.
 - Front-end assets are housed in `ui-vue/` (Vue 3 + Vite + TypeScript) and consume backend SSE from `/events`.
 - Infrastructure files such as `docker-compose.yml` and `nats.conf` bootstrap the local NATS JetStream broker and monitoring UI.
+- The `.data/` tree (placeholder datasets, JetStream state, etc.) must stay in the repo; do not delete this directory when committing changes, even if its contents are regenerated locally.
 
 ## Build, Test, and Development Commands
 - `PYTHONPATH=. python -m unittest discover -s tests` runs the neuron suite headless.
