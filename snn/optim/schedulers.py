@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 
 class WarmupCosineScheduler:
@@ -28,6 +28,9 @@ class WarmupCosineScheduler:
         self.restart_index = 0
         self.cycle_step = 0
         self._explicit_warmup = warmup_steps
+        self._has_restarts = bool(restarts)
+        self._just_restarted = False
+        self._last_restart_info: Optional[Dict[str, int]] = None
 
     def _current_cycle_length(self) -> int:
         if self.restart_index < len(self.restart_lengths):
@@ -55,8 +58,26 @@ class WarmupCosineScheduler:
         return lr
 
     def _advance_cycle(self, cycle_length: int) -> None:
+        self._just_restarted = False
         self.cycle_step += 1
         if self.cycle_step >= cycle_length:
             self.cycle_step = 0
+            if self._has_restarts:
+                next_index = min(self.restart_index + 1, len(self.restart_lengths) - 1)
+                next_cycle = self.restart_lengths[next_index]
+                self._last_restart_info = {
+                    "cycle_index": self.restart_index,
+                    "cycle_length": int(cycle_length),
+                    "next_cycle_length": int(next_cycle),
+                }
+                self._just_restarted = True
             if self.restart_index + 1 < len(self.restart_lengths):
                 self.restart_index += 1
+
+    def consume_restart(self) -> Optional[Dict[str, int]]:
+        if not self._just_restarted:
+            return None
+        self._just_restarted = False
+        if self._last_restart_info is None:
+            return None
+        return dict(self._last_restart_info)

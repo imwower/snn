@@ -42,6 +42,9 @@ from .mq import InMemoryQueue, Message, MessageQueue, build_message_queue
 from .neuron import ThreeCompartmentParams
 
 logger = logging.getLogger(__name__)
+LOW_CONF_THRESHOLD = 0.11
+LOW_CONF_STREAK = 5
+LOGIT_SCALE_BOOST = 1.1
 
 
 def _current_millis() -> int:
@@ -1373,6 +1376,10 @@ class TrainingService:
         ema_loss: Optional[float] = None
         ema_acc: Optional[float] = None
         head_frozen = unfreeze_threshold > 0.0
+        low_conf_streak = 0
+        g_apical_value = getattr(self._params, "coupling_apical", 0.0)
+        beta_value = getattr(self._params, "coupling_basal", 0.0)
+        v_th_value = getattr(self._params, "threshold", 0.0)
 
         try:
             for epoch in range(1, epochs + 1):
@@ -1538,6 +1545,35 @@ class TrainingService:
                             learnable_logit_scale=False,
                             logit_scale_grad=None,
                         )
+                    if confidence < LOW_CONF_THRESHOLD:
+                        low_conf_streak += 1
+                    else:
+                        low_conf_streak = 0
+                    if low_conf_streak >= LOW_CONF_STREAK:
+                        prev_scale = model.logit_scale
+                        boosted_scale = float(
+                            np.clip(
+                                prev_scale * LOGIT_SCALE_BOOST,
+                                logit_scale_min,
+                                logit_scale_max,
+                            )
+                        )
+                        model.logit_scale = boosted_scale
+                        low_conf_streak = 0
+                        await self._emit_log(
+                            "INFO",
+                            (
+                                f"[auto-heal] low confidence streak={LOW_CONF_STREAK} "
+                                f"logit_scale {prev_scale:.3f}->{boosted_scale:.3f}"
+                            ),
+                            metric={
+                                "epoch": epoch,
+                                "step": step + 1,
+                                "prev_scale": prev_scale,
+                                "logit_scale": boosted_scale,
+                                "threshold": LOW_CONF_THRESHOLD,
+                            },
+                        )
                     if batch_acc == 0.0 and zero_acc_logs < 3:
                         label_hist = np.bincount(batch_y, minlength=num_classes).tolist()
                         pred_hist = np.bincount(predictions, minlength=num_classes).tolist()
@@ -1582,6 +1618,9 @@ class TrainingService:
                     if use_residual_metric and batch_size_actual > 0:
                         epoch_residuals.append(residual_value)
     
+                    lr_head = current_lr
+                    lr_rec = current_lr
+                    delta_norm = grad_norm * current_lr if grad_norm and current_lr else 0.0
                     metrics_payload = {
                         "phase": "train",
                         "epoch": epoch,
@@ -1597,6 +1636,8 @@ class TrainingService:
                         "ema_loss": ema_loss,
                         "ema_acc": ema_acc,
                         "lr": current_lr,
+                        "lr_head": lr_head,
+                        "lr_rec": lr_rec,
                         "temperature": temperature,
                         "logit_scale": model.logit_scale,
                         "logit_mean": logit_mean,
@@ -1610,6 +1651,8 @@ class TrainingService:
                         "k_bin": epoch_bin,
                         "examples": int(batch_x.shape[0]),
                         "time_unix": _current_millis(),
+                        "grad_norm": grad_norm,
+                        "delta_norm": delta_norm,
                     }
                     iter_payload = {
                         "epoch": epoch,
@@ -1723,6 +1766,11 @@ class TrainingService:
                     "train_logit_std": train_logit_std,
                     "s_rate": val_s_rate,
                     "rate_target": rate_target,
+                    "ema_in_use": False,
+                    "rate": train_s_rate_epoch,
+                    "g_apical": g_apical_value,
+                    "beta": beta_value,
+                    "v_th": v_th_value,
                 }
                 if residual_mean is not None:
                     epoch_payload["residual"] = residual_mean
@@ -1767,6 +1815,11 @@ class TrainingService:
                     "logit_scale": model.logit_scale,
                     "rate_target": rate_target,
                     "steps_per_epoch": steps_per_epoch,
+                    "rate": train_s_rate_epoch,
+                    "g_apical": g_apical_value,
+                    "beta": beta_value,
+                    "v_th": v_th_value,
+                    "ema_in_use": False,
                 }
                 if avg_throughput is not None:
                     log_metric["avg_throughput"] = avg_throughput
