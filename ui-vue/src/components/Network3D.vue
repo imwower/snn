@@ -39,11 +39,18 @@ let edgeIntensity = new Float32Array(0);
 let edgeIndexMap = new Map<string, number>();
 let nodeToEdges = new Map<number, number[]>();
 let edgesList: Array<{ src: number; dst: number }> = [];
+let layerLabelGroup: THREE.Group | null = null;
 
 const baseNodeColor = new THREE.Color('#1d4ed8');
 const highlightNodeColor = new THREE.Color('#fde047');
 const baseEdgeColor = new THREE.Color('#1f2937');
 const highlightEdgeColor = new THREE.Color('#f97316');
+const baseEdgeOpacity = 0.06;
+const maxEdgeOpacity = 0.35;
+const edgeOpacityRamp = 0.45;
+const layerLabelOffset = 1.8;
+const layerLabelLift = 0.4;
+const layerLabelScale = 0.015;
 const baseEdgeHSL = { h: 0, s: 0, l: 0 };
 const highlightEdgeHSL = { h: 0, s: 0, l: 0 };
 baseEdgeColor.getHSL(baseEdgeHSL);
@@ -53,10 +60,14 @@ const boundsBox = new THREE.Box3();
 const boundsCenter = new THREE.Vector3();
 const boundsSize = new THREE.Vector3();
 const tempVector = new THREE.Vector3();
+const layerCenterTemp = new THREE.Vector3();
 
 const clock = new THREE.Clock();
 const backdropColorHex = '#e5e7eb';
 const backdropOpacity = 0.7;
+const suppressContextMenu = (event: MouseEvent) => {
+  event.preventDefault();
+};
 
 const disposeNodes = () => {
   if (nodeMesh && scene) {
@@ -93,6 +104,130 @@ const disposeEdges = () => {
   edgeIndexMap = new Map();
   nodeToEdges = new Map();
   edgesList = [];
+};
+
+const disposeLayerLabels = () => {
+  if (layerLabelGroup && scene) {
+    layerLabelGroup.children.forEach((child) => {
+      if (child instanceof THREE.Sprite) {
+        const material = child.material as THREE.SpriteMaterial | THREE.SpriteMaterial[] | undefined;
+        if (material && !Array.isArray(material)) {
+          material.map?.dispose();
+          material.dispose();
+        }
+      }
+    });
+    scene.remove(layerLabelGroup);
+  }
+  layerLabelGroup = null;
+};
+
+const drawRoundedRect = (
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number
+) => {
+  const r = Math.min(radius, width / 2, height / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + width - r, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+  ctx.lineTo(x + width, y + height - r);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  ctx.lineTo(x + r, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+};
+
+const createLayerLabelSprite = (text: string) => {
+  if (typeof document === 'undefined') {
+    return null;
+  }
+  const fontSize = 48;
+  const paddingX = 30;
+  const paddingY = 18;
+  const deviceRatio = typeof window !== 'undefined' ? Math.max(1, window.devicePixelRatio || 1) : 1;
+  const canvas = document.createElement('canvas');
+  const measureCtx = canvas.getContext('2d');
+  if (!measureCtx) {
+    return null;
+  }
+  measureCtx.font = `${fontSize}px "Inter", "SF Pro Display", "PingFang SC", "Helvetica Neue", sans-serif`;
+  const textWidth = measureCtx.measureText(text).width;
+  const width = textWidth + paddingX * 2;
+  const height = fontSize + paddingY * 2;
+  canvas.width = Math.ceil(width * deviceRatio);
+  canvas.height = Math.ceil(height * deviceRatio);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    return null;
+  }
+  ctx.scale(deviceRatio, deviceRatio);
+  ctx.font = measureCtx.font;
+  ctx.textBaseline = 'middle';
+  ctx.strokeStyle = 'rgba(59, 130, 246, 0.35)';
+  ctx.lineWidth = 2;
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+  drawRoundedRect(ctx, 0, 0, width, height, 14);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = '#f8fafc';
+  ctx.fillText(text, paddingX, height / 2);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.needsUpdate = true;
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.generateMipmaps = false;
+
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false
+  });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(width * layerLabelScale, height * layerLabelScale, 1);
+  sprite.renderOrder = 10;
+  return sprite;
+};
+
+const buildLayerLabels = (layouts: LayerLayout[]) => {
+  disposeLayerLabels();
+  if (!scene || !layouts.length) {
+    return;
+  }
+  layerLabelGroup = new THREE.Group();
+  layouts.forEach((layout, index) => {
+    if (layout.count === 0) {
+      return;
+    }
+    const sprite = createLayerLabelSprite(`层 ${index + 1}`);
+    if (!sprite) {
+      return;
+    }
+    layerCenterTemp.set(0, 0, 0);
+    for (let i = 0; i < layout.count; i += 1) {
+      const offset = i * 3;
+      layerCenterTemp.x += layout.positions[offset];
+      layerCenterTemp.y += layout.positions[offset + 1];
+      layerCenterTemp.z += layout.positions[offset + 2];
+    }
+    layerCenterTemp.multiplyScalar(1 / layout.count);
+    const direction = layerCenterTemp.x >= 0 ? 1 : -1;
+    const horizontalPadding = layerLabelOffset + sprite.scale.x / 2;
+    const labelX = layerCenterTemp.x + direction * horizontalPadding;
+    const labelY = layerCenterTemp.y + layerLabelLift;
+    sprite.position.set(labelX, labelY, layerCenterTemp.z);
+    layerLabelGroup!.add(sprite);
+  });
+  scene.add(layerLabelGroup);
 };
 
 const buildEdges = (layouts: LayerLayout[]) => {
@@ -180,7 +315,7 @@ const buildEdges = (layouts: LayerLayout[]) => {
   edgeMaterial = new LineMaterial({
     vertexColors: true,
     transparent: true,
-    opacity: 0.45,
+    opacity: baseEdgeOpacity,
     linewidth: 3.2,
     depthWrite: false,
     blending: THREE.AdditiveBlending
@@ -273,12 +408,14 @@ const rebuildScene = (layouts: LayerLayout[]) => {
   if (!layouts.length) {
     disposeNodes();
     disposeEdges();
+    disposeLayerLabels();
     updateCameraForLayout();
     return;
   }
 
   buildNodes(layouts);
   buildEdges(layouts);
+  buildLayerLabels(layouts);
   updateCameraForLayout();
 };
 
@@ -449,7 +586,8 @@ const animate = () => {
     edgeColorAttrEnd.data.needsUpdate = true;
   }
   if (edgeMaterial) {
-    edgeMaterial.opacity = 0.25 + Math.min(0.6, maxEdge * 0.85);
+    const extraOpacity = Math.min(maxEdgeOpacity - baseEdgeOpacity, maxEdge * edgeOpacityRamp);
+    edgeMaterial.opacity = baseEdgeOpacity + extraOpacity;
   }
 
   controls?.update();
@@ -484,6 +622,7 @@ onMounted(() => {
   renderer.setSize(clientWidth || 800, clientHeight || 600);
   renderer.setClearColor(backdropColorHex, backdropOpacity);
   container.value.appendChild(renderer.domElement);
+  renderer.domElement.addEventListener('contextmenu', suppressContextMenu);
 
   camera = new THREE.PerspectiveCamera(50, (clientWidth || 800) / (clientHeight || 600), 0.1, 1000);
   camera.position.set(-12, 10, 40);
@@ -500,7 +639,13 @@ onMounted(() => {
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
-  controls.enablePan = false;
+  controls.enablePan = true;
+  controls.screenSpacePanning = true;
+  controls.mouseButtons = {
+    LEFT: THREE.MOUSE.ROTATE,
+    MIDDLE: THREE.MOUSE.DOLLY,
+    RIGHT: THREE.MOUSE.PAN
+  };
   controls.minDistance = 6;
   controls.maxDistance = 120;
   controls.target.set(0, 0, 0);
@@ -518,12 +663,14 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', resize);
   controls?.dispose();
   if (renderer) {
+    renderer.domElement.removeEventListener('contextmenu', suppressContextMenu);
     renderer.dispose();
     const canvas = renderer.domElement;
     canvas.parentElement?.removeChild(canvas);
   }
   disposeNodes();
   disposeEdges();
+  disposeLayerLabels();
   scene = null;
   camera = null;
   renderer = null;
