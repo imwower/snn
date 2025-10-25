@@ -2,8 +2,8 @@ __pycache__/
 *.py[cod]
 
 .idea
-/.data/nats/
-/.data/nui/
+
 /.venv/
 /ui-vue/node_modules/
 /ui-vue/dist
+.data
