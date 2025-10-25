@@ -102,21 +102,22 @@ training_service:
   mode: fpt
   network_size: 128
   layers: 2
-  epochs: 20
+  epochs: 40
   lr: 0.001
   scheduler: warmup_cosine
   warmup_steps: 200
-  min_lr_scale: 0.1
+  min_lr_scale: 0.3
   min_lr: null
   weight_decay: 0.0001
   grad_clip: 1.0
-  K: 4
-  tol: 1.0e-5
+  K: 6
+  tol: 5.0e-6
   T: 12
   solver: anderson
   anderson_m: 4
   anderson_beta: 0.5
   K_schedule: auto
+  fp_damping: 0.85
   temperature: 1.0
   logit_scale: 1.25
   logit_scale_learnable: false
@@ -151,13 +152,13 @@ train:
   scheduler:
     type: warmup_cosine
     warmup_ratio: 0.05
-    min_lr_ratio: 0.1
+    min_lr_ratio: 0.3
     restarts: []
   solver: anderson
   anderson_m: 4
   anderson_beta: 0.5
   K_schedule: [2, 3, 4]
-  tol: 1.0e-5
+  tol: 5.0e-6
   lambda_contr: 1.0e-4
   rho_max: 0.9
   rate_reg_lambda: 1.0e-3

@@ -29,6 +29,7 @@ export interface TrainingConfig {
   lr: number;
   K: number;
   tol: number;
+  fp_damping?: number;
   T?: number;
   epochs: number;
   solver?: 'plain' | 'anderson';
@@ -117,6 +118,8 @@ export interface TrainInitEvent {
   timesteps?: number;
   fixed_point_K?: number;
   fixed_point_tol?: number;
+  fixed_point_damping?: number;
+  fp_damping?: number;
   hidden?: number;
   layers?: number;
   lr?: number;

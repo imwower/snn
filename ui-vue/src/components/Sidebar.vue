@@ -29,24 +29,33 @@
         <label>
           <span>lr</span>
           <input type="number" step="0.0001" v-model.number="lr" />
-          <span class="hint">学习率，默认 1e-3；尝试 5e-4 ~ 2e-3 平衡收敛速度与稳定性。</span>
+          <span class="hint">学习率，默认 1e-3；余弦调度会衰减到约 0.3×，可在 5e-4 ~ 2e-3 之间微调。</span>
         </label>
         <label>
           <span>K</span>
           <input type="number" min="1" v-model.number="K" />
-          <span class="hint">K 表示突触邻域大小，10~30 可形成适中稀疏连接。</span>
+          <span class="hint">固定点迭代次数，越大越稳。默认 6，通常 6~10 就能压低残差。</span>
         </label>
         <label>
           <span>tol</span>
           <input type="number" step="0.000001" v-model.number="tol" />
-          <span class="hint">容差阈值控制停止条件，越小越精准但耗时更久。</span>
+          <span class="hint">容差阈值控制停止条件，5e-6 可明显减少残差。</span>
         </label>
         <label>
           <span>epochs</span>
           <input type="number" min="1" v-model.number="epochs" />
-          <span class="hint">训练轮次数量，通常 3~10 可观察收敛趋势。</span>
+          <span class="hint">训练轮次数量，建议至少 30~50 以给新 lr 调度充分时间。</span>
+        </label>
+        <label>
+          <span>damping</span>
+          <input type="number" min="0.05" max="1" step="0.01" v-model.number="fpDamping" />
+          <span class="hint">固定点阻尼系数，0.8~0.9 可抑制震荡，默认 0.85。</span>
         </label>
       </fieldset>
+      <div class="training-tip">
+        <p class="tip-title">推荐节奏</p>
+        <p>默认 40 epoch + 0.3× 最小学习率，可先延长训练再微调 lr，再配合 0.85 阻尼让残差低于 1e-3。</p>
+      </div>
     </div>
     <div class="buttons">
       <button @click="handlePrimaryAction" :disabled="primaryButtonDisabled">
@@ -110,6 +119,10 @@ const tol = computed({
 const epochs = computed({
   get: () => store.cfg.epochs,
   set: (value: number) => store.setCfg({ epochs: value })
+});
+const fpDamping = computed({
+  get: () => store.cfg.fp_damping ?? 0.85,
+  set: (value: number) => store.setCfg({ fp_damping: value })
 });
 
 const downloadLocked = computed(() => store.isDownloadActive || isBusy.value);
@@ -177,7 +190,8 @@ watch(
     store.cfg.solver,
     store.cfg.anderson_m,
     store.cfg.anderson_beta,
-    store.cfg.K_schedule
+    store.cfg.K_schedule,
+    store.cfg.fp_damping
   ],
   () => {
     hasInitialized.value = false;
@@ -251,6 +265,7 @@ const initTraining = () =>
         lr: store.cfg.lr,
         K: store.cfg.K,
         tol: store.cfg.tol,
+        fp_damping: store.cfg.fp_damping,
         T: store.cfg.T,
         epochs: store.cfg.epochs,
         solver: store.cfg.solver,

@@ -105,6 +105,7 @@ class TrainingInitRequest(BaseModel):
     lr: float = Field(gt=0.0, description="学习率")
     K: int = Field(ge=1, description="固定点迭代次数 / 近邻大小")
     tol: float = Field(gt=0.0, description="固定点容差")
+    fp_damping: float = Field(default=0.85, gt=0.0, le=1.0, description="固定点阻尼系数")
     T: Optional[int] = Field(default=None, description="时间步长（tstep 模式）")
     epochs: int = Field(ge=1, description="训练轮次")
     solver: str = Field(default="plain", description="固定点求解器：plain 或 anderson")
@@ -833,10 +834,11 @@ class TrainingService:
             "network_size": 128,
             "layers": 2,
             "lr": 1e-3,
-            "K": 4,
-            "tol": 1e-5,
+            "K": 6,
+            "tol": 5e-6,
+            "fp_damping": 0.85,
             "T": 12,
-            "epochs": 20,
+            "epochs": 40,
             "solver": "anderson",
             "anderson_m": 4,
             "anderson_beta": 0.5,
@@ -844,11 +846,11 @@ class TrainingService:
             "temperature": 1.0,
             "logit_scale": 1.25,
             "logit_scale_learnable": False,
-            "epochs": 20,
+            "epochs": 40,
             "warmup_steps": 200,
             "scheduler": "warmup_cosine",
             "min_lr": None,
-            "min_lr_scale": 0.1,
+            "min_lr_scale": 0.3,
             "weight_decay": 1e-4,
             "grad_clip": 1.0,
             "rate_reg_lambda": 1e-3,
@@ -870,7 +872,7 @@ class TrainingService:
         self._model_state: Optional[ModelState] = None
         self._np_seed = 1234
         self._params = ThreeCompartmentParams()
-        self._kernel_cache: Dict[Tuple[int, int, float, float], np.ndarray] = {}
+        self._kernel_cache: Dict[Tuple[int, int, float, float, str, int, float, float], np.ndarray] = {}
 
     @property
     def status(self) -> str:
@@ -898,6 +900,7 @@ class TrainingService:
             "warmup_steps",
             "min_lr",
             "min_lr_scale",
+            "fp_damping",
             "scheduler",
             "solver",
             "anderson_m",
@@ -1039,12 +1042,13 @@ class TrainingService:
                 return format(value, fmt)
             return str(value)
 
+        fp_damping = _fmt(self._config.get("fp_damping", "n/a"), ".2f")
         message = (
             f"[config:{reason}] dataset={dataset} mode={mode} epochs={epochs} layers={layers} "
             f"neurons={network_size} lr={_fmt(lr)} solver={solver} anderson_m={anderson_m} "
             f"anderson_beta={_fmt(anderson_beta)} scheduler={scheduler} warmup={warmup_steps} "
             f"steps_per_epoch={steps_per_epoch} weight_decay={_fmt(weight_decay)} "
-            f"grad_clip={_fmt(grad_clip)} logit_scale={_fmt(logit_scale)} "
+            f"grad_clip={_fmt(grad_clip)} logit_scale={_fmt(logit_scale)} damping={fp_damping} "
             f"rate_reg_lambda={_fmt(rate_reg_lambda)} rate_target={_fmt(rate_target)}"
         )
         metric = {
@@ -1063,6 +1067,7 @@ class TrainingService:
             "weight_decay": weight_decay,
             "grad_clip": grad_clip,
             "logit_scale": logit_scale,
+            "fp_damping": self._config.get("fp_damping"),
             "rate_reg_lambda": rate_reg_lambda,
             "rate_target": rate_target,
         }
@@ -1122,6 +1127,7 @@ class TrainingService:
                 "timesteps": payload.T,
                 "fixed_point_K": payload.K,
                 "fixed_point_tol": payload.tol,
+                "fixed_point_damping": payload.fp_damping,
                 "solver": payload.solver,
                 "anderson_m": payload.anderson_m,
                 "anderson_beta": payload.anderson_beta,
@@ -1208,6 +1214,8 @@ class TrainingService:
         timesteps = int(config.get("T") or 12)
         base_iterations = max(1, int(config.get("K", 3)))
         tolerance = float(_train_param("tol", config.get("tol", 1e-5)))
+        fp_damping = float(_train_param("fp_damping", config.get("fp_damping", 0.85)))
+        fp_damping = float(np.clip(fp_damping, 1e-3, 1.0))
         solver = str(_train_param("solver", config.get("solver", "anderson"))).lower()
         anderson_m = max(1, int(_train_param("anderson_m", config.get("anderson_m", 4))))
         anderson_beta = float(_train_param("anderson_beta", config.get("anderson_beta", 0.5)))
@@ -1216,6 +1224,7 @@ class TrainingService:
         fp_kernel_config = FixedPointConfig(
             iterations=base_iterations,
             tolerance=tolerance,
+            damping=fp_damping,
             solver=solver,
             anderson_m=anderson_m,
             anderson_beta=anderson_beta,
@@ -1302,7 +1311,7 @@ class TrainingService:
                 f"using solver={solver} K={base_iterations} T={timesteps} "
                 f"temperature={temperature} K_schedule={k_schedule_label} "
                 f"scheduler={scheduler_name} warmup={warmup_steps} steps_per_epoch={steps_per_epoch} "
-                f"rate_reg={rate_reg_value} grad_clip={grad_clip} head_hidden={head_hidden} "
+                f"damping={fp_damping:.2f} rate_reg={rate_reg_value} grad_clip={grad_clip} head_hidden={head_hidden} "
                 f"augment={'on' if augment_enabled else 'off'}"
             ),
             metric={
@@ -1312,6 +1321,7 @@ class TrainingService:
                 "K_schedule": k_schedule_label,
                 "scheduler": scheduler_name,
                 "temperature": temperature,
+                "fp_damping": fp_damping,
                 "rate_reg_lambda": rate_reg_lambda,
                 "rate_target": rate_target,
                 "warmup_steps": warmup_steps,
@@ -1671,6 +1681,7 @@ class TrainingService:
                         "solver": solver,
                         "k": actual_iters,
                         "residual": residual_value,
+                        "damping": fp_damping,
                     }
     
                     await self._broker.publish("train_iter", iter_payload)
@@ -1771,6 +1782,7 @@ class TrainingService:
                     "g_apical": g_apical_value,
                     "beta": beta_value,
                     "v_th": v_th_value,
+                    "fixed_point_damping": fp_damping,
                 }
                 if residual_mean is not None:
                     epoch_payload["residual"] = residual_mean
@@ -1820,6 +1832,7 @@ class TrainingService:
                     "beta": beta_value,
                     "v_th": v_th_value,
                     "ema_in_use": False,
+                    "fixed_point_damping": fp_damping,
                 }
                 if avg_throughput is not None:
                     log_metric["avg_throughput"] = avg_throughput
@@ -1870,6 +1883,7 @@ class TrainingService:
             config.solver,
             config.anderson_m,
             config.anderson_beta,
+            config.damping,
         )
         kernel = self._kernel_cache.get(key)
         if kernel is None:

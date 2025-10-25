@@ -180,6 +180,27 @@ legend {
   line-height: 1.3;
 }
 
+.training-tip {
+  border-radius: 10px;
+  border: 1px solid rgba(94, 240, 193, 0.35);
+  background: linear-gradient(135deg, rgba(94, 240, 193, 0.08), rgba(76, 201, 240, 0.08));
+  padding: 12px 14px;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.training-tip .tip-title {
+  margin: 0 0 4px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent-strong);
+}
+
+.training-tip p {
+  margin: 0;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));

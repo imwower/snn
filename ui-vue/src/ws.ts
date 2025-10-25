@@ -104,9 +104,21 @@ const handleSysLog = (payload: UISysLogEvent) => {
   }
 };
 
+const resolveDamping = (payload: Pick<TrainInitEvent, 'fixed_point_damping' | 'fp_damping'>) => {
+  if (typeof payload.fixed_point_damping === 'number') {
+    return payload.fixed_point_damping;
+  }
+  if (typeof payload.fp_damping === 'number') {
+    return payload.fp_damping;
+  }
+  return null;
+};
+
 const handleTrainInit = (payload: TrainInitEvent) => {
   console.log('[UI] train_init', payload);
-  const text = `[INIT] dataset=${payload.dataset ?? '-'} epochs=${payload.epochs ?? '-'} batch=${payload.batch_size ?? '-'} layers=${payload.layers ?? '-'} T=${payload.timesteps ?? '-'} K=${payload.fixed_point_K ?? '-'} lr=${payload.lr ?? '-'}`;
+  const damping = resolveDamping(payload);
+  const dampingText = damping !== null ? damping.toFixed(2) : 'n/a';
+  const text = `[INIT] dataset=${payload.dataset ?? '-'} epochs=${payload.epochs ?? '-'} batch=${payload.batch_size ?? '-'} layers=${payload.layers ?? '-'} T=${payload.timesteps ?? '-'} K=${payload.fixed_point_K ?? '-'} ζ=${dampingText} lr=${payload.lr ?? '-'}`;
   storeInstance?.setStatus('Idle');
   if (storeInstance) {
     const current = storeInstance.cfg;
@@ -118,6 +130,7 @@ const handleTrainInit = (payload: TrainInitEvent) => {
       network_size: typeof payload.hidden === 'number' ? payload.hidden : current.network_size,
       layers: typeof payload.layers === 'number' ? payload.layers : current.layers,
       tol: typeof payload.fixed_point_tol === 'number' ? payload.fixed_point_tol : current.tol,
+      fp_damping: typeof damping === 'number' ? damping : current.fp_damping,
       epochs: typeof payload.epochs === 'number' ? payload.epochs : current.epochs
     });
     storeInstance.prepareRun(payload);
@@ -234,7 +247,9 @@ const fetchConfig = async () => {
     const cfg = await response.json();
     const training = cfg?.training as TrainInitEvent | undefined;
     if (training) {
-      const text = `[CONFIG] dataset=${training.dataset ?? '-'} epochs=${training.epochs ?? '-'} batch=${training.batch_size ?? '-'} T=${training.timesteps ?? '-'} K=${training.fixed_point_K ?? '-'} lr=${training.lr ?? '-'}`;
+      const damping = resolveDamping(training);
+      const dampingText = damping !== null ? damping.toFixed(2) : 'n/a';
+      const text = `[CONFIG] dataset=${training.dataset ?? '-'} epochs=${training.epochs ?? '-'} batch=${training.batch_size ?? '-'} T=${training.timesteps ?? '-'} K=${training.fixed_point_K ?? '-'} ζ=${dampingText} lr=${training.lr ?? '-'}`;
       pushTextLog(text);
       const current = store.cfg;
       store.setCfg({
@@ -244,6 +259,7 @@ const fetchConfig = async () => {
         T: typeof training.timesteps === 'number' ? training.timesteps : current.T,
         network_size: typeof training.hidden === 'number' ? training.hidden : current.network_size,
         tol: typeof training.fixed_point_tol === 'number' ? training.fixed_point_tol : current.tol,
+        fp_damping: typeof damping === 'number' ? damping : current.fp_damping,
         epochs: typeof training.epochs === 'number' ? training.epochs : current.epochs
       });
     }
