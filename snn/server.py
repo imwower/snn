@@ -64,6 +64,14 @@ def _clip_gradients_inplace(
     max_norm: float,
     extra: Optional[Dict[str, np.ndarray]] = None,
 ) -> float:
+    if max_norm is None or max_norm <= 0.0:
+        total = 0.0
+        for grad in grads.values():
+            total += float(np.sum(np.square(grad)))
+        if extra:
+            for value in extra.values():
+                total += float(np.sum(np.square(value)))
+        return math.sqrt(max(total, 0.0))
     total = 0.0
     for grad in grads.values():
         total += float(np.sum(np.square(grad)))
@@ -71,7 +79,7 @@ def _clip_gradients_inplace(
         for value in extra.values():
             total += float(np.sum(np.square(value)))
     norm = math.sqrt(max(total, 0.0))
-    if max_norm > 0.0 and math.isfinite(norm) and norm > max_norm:
+    if math.isfinite(norm) and norm > max_norm:
         scale = max_norm / (norm + 1e-12)
         for key in grads.keys():
             grads[key] *= scale
@@ -1072,8 +1080,7 @@ class TrainingService:
             anderson_beta=anderson_beta,
         )
         kernel = self._get_basal_kernel(timesteps, base_iterations, tolerance, self._params.dt, fp_kernel_config)
-        scheduler_name = str(config.get("scheduler", "cosine")).lower()
-        warmup_steps = int(max(0, _train_param("warmup_steps", config.get("warmup_steps", 0))))
+        scheduler_name = "cosine"
         grad_clip = float(max(0.0, _train_param("grad_clip", config.get("grad_clip", 0.0))))
         base_lr = float(max(1e-6, _train_param("lr", config.get("lr", 1e-3))))
         min_lr_override = _train_param("min_lr", config.get("min_lr"))
@@ -1085,6 +1092,22 @@ class TrainingService:
         logit_scale_learnable = bool(_train_param("logit_scale_learnable", False))
         k_schedule_label = k_schedule_raw or "none"
         rate_reg_value = config.get("rate_reg_lambda", "0")
+        num_classes = dataset.num_classes
+        batch_size = int(np.clip(config.get("network_size", 256), 32, 256))
+        layers_count = max(1, int(config.get("layers", 1)))
+        epochs = max(1, int(config.get("epochs", 1)))
+        ema_decay = 0.9
+
+        model = self._init_model(dataset.input_dim, timesteps, num_classes, np_rng, initial_logit_scale)
+        self._model_state = model
+
+        train_x = dataset.train_x
+        train_y = dataset.train_y
+        total_examples = train_x.shape[0]
+        steps_per_epoch = math.ceil(total_examples / batch_size)
+        total_steps = max(1, epochs * steps_per_epoch)
+        warmup_steps = max(1, int(math.ceil(total_steps * 0.05)))
+        warmup_steps = max(1, int(math.ceil(total_steps * 0.05)))
         await self._emit_log(
             "INFO",
             (
@@ -1110,8 +1133,25 @@ class TrainingService:
                 "weight_decay": weight_decay,
             },
         )
+        await self._emit_log(
+            "INFO",
+            (
+                "config summary: mode=%s lr=%.5f min_lr=%.5f weight_decay=%.4f grad_clip=%.2f "
+                "scheduler=%s warmup_steps=%d logit_scale=%.3f rate_target=%s"
+            )
+            % (
+                config.get("mode", "fpt"),
+                base_lr,
+                min_lr,
+                weight_decay,
+                grad_clip,
+                scheduler_name,
+                warmup_steps,
+                initial_logit_scale,
+                config.get("rate_target"),
+            ),
+        )
 
-        num_classes = dataset.num_classes
         train_shape = dataset.train_x.shape
         val_shape = dataset.val_x.shape
         train_counts = np.bincount(dataset.train_y, minlength=num_classes).tolist()
@@ -1128,19 +1168,6 @@ class TrainingService:
             f"训练集标签分布：{train_counts}; 验证集标签分布：{val_counts}",
         )
 
-        batch_size = int(np.clip(config.get("network_size", 256), 32, 256))
-        layers_count = max(1, int(config.get("layers", 1)))
-        epochs = max(1, int(config.get("epochs", 1)))
-        ema_decay = 0.9
-
-        model = self._init_model(dataset.input_dim, timesteps, num_classes, np_rng, initial_logit_scale)
-        self._model_state = model
-
-        train_x = dataset.train_x
-        train_y = dataset.train_y
-        total_examples = train_x.shape[0]
-        steps_per_epoch = math.ceil(total_examples / batch_size)
-        total_steps = max(1, epochs * steps_per_epoch)
         global_step = 0
         best_acc = 0.0
         best_loss = float("inf")
@@ -1156,14 +1183,28 @@ class TrainingService:
                 epoch_acc_total = 0.0
                 epoch_examples = 0
                 epoch_residuals: List[float] = []
+                epoch_conf_total = 0.0
+                epoch_entropy_total = 0.0
+                epoch_logit_sum = 0.0
+                epoch_logit_sq_sum = 0.0
+                epoch_logit_count = 0
+                epoch_s_rate = 0.0
                 epoch_bin, epoch_k_limit = self._k_limit_for_epoch(
                     epoch, epochs, k_schedule_values, base_iterations
+                )
+                preview_step = min(global_step + 1, total_steps)
+                preview_lr = _cosine_with_warmup(
+                    preview_step,
+                    base_lr,
+                    warmup_steps,
+                    total_steps,
+                    min_lr,
                 )
                 await self._emit_log(
                     "INFO",
                     (
                         f"开始 epoch={epoch}/{epochs} steps={steps_per_epoch} "
-                        f"batch_size={batch_size} lr={base_lr:.5f}"
+                        f"batch_size={batch_size} lr={preview_lr:.8f}"
                     ),
                 )
                 zero_acc_logs = 0
@@ -1179,11 +1220,11 @@ class TrainingService:
                         )
                         await self._broker.publish("train_status", {"status": "Stopped", "time_unix": _current_millis()})
                         return
-
+    
                     batch_idx = indices[step * batch_size : (step + 1) * batch_size]
                     batch_x = train_x[batch_idx]
                     batch_y = train_y[batch_idx]
-
+    
                     batch_size_actual = batch_x.shape[0]
                     if batch_y.dtype != np.int64:
                         raise AssertionError(f"batch labels must be int64, got {batch_y.dtype}")
@@ -1194,7 +1235,7 @@ class TrainingService:
                             raise AssertionError(
                                 f"batch labels must be within [0, {num_classes}), got [{y_min}, {y_max}]"
                             )
-
+    
                     global_step += 1
                     if scheduler_name == "cosine":
                         current_lr = _cosine_with_warmup(global_step, base_lr, warmup_steps, total_steps, min_lr)
@@ -1213,6 +1254,15 @@ class TrainingService:
                     logits = logits_raw * scale_factor
                     loss, probs, grad_logits_scaled = self._cross_entropy(logits, batch_y)
                     grad_logits = grad_logits_scaled * scale_factor
+                    probs_safe = np.clip(probs, 1e-12, 1.0)
+                    entropy = (
+                        float(np.mean(-np.sum(probs_safe * np.log(probs_safe), axis=1))) if probs.size else 0.0
+                    )
+                    confidence = (
+                        float(np.mean(probs[np.arange(batch_y.shape[0]), batch_y])) if batch_y.size else 0.0
+                    )
+                    logit_mean = float(np.mean(logits)) if logits.size else 0.0
+                    logit_std = float(np.std(logits)) if logits.size else 0.0
                     logit_scale_grad = None
                     if logit_scale_learnable:
                         inv_temp = 1.0 / temperature
@@ -1223,12 +1273,18 @@ class TrainingService:
                     batch_acc = float(np.mean(predictions == batch_y))
                     top5_hits = np.any(np.argsort(probs, axis=1)[:, -5:] == batch_y[:, None], axis=1)
                     top5_acc = float(np.mean(top5_hits))
-
+    
                     if batch_size_actual > 0:
                         epoch_loss_total += loss * batch_size_actual
                         epoch_acc_total += batch_acc * batch_size_actual
                         epoch_examples += batch_size_actual
-
+                        epoch_conf_total += confidence * batch_size_actual
+                        epoch_entropy_total += entropy * batch_size_actual
+                    if logits.size:
+                        epoch_logit_sum += float(np.sum(logits))
+                        epoch_logit_sq_sum += float(np.sum(logits ** 2))
+                        epoch_logit_count += logits.size
+    
                     grads = self._compute_gradients(batch_x, grad_logits, kernel)
                     extra_grads = None
                     if logit_scale_grad is not None:
@@ -1239,20 +1295,18 @@ class TrainingService:
                     if batch_acc == 0.0 and zero_acc_logs < 3:
                         label_hist = np.bincount(batch_y, minlength=num_classes).tolist()
                         pred_hist = np.bincount(predictions, minlength=num_classes).tolist()
-                        logits_mean = float(np.mean(logits)) if logits.size else 0.0
-                        logits_std = float(np.std(logits)) if logits.size else 0.0
-                        true_prob = float(np.mean(probs[np.arange(batch_y.shape[0]), batch_y])) if batch_y.size else 0.0
+                        true_prob = confidence
                         top_pred_prob = float(np.mean(np.max(probs, axis=1))) if probs.size else 0.0
                         msg = (
                             f"epoch={epoch} step={step + 1} 检测到 acc=0.0："
                             f"label_hist={label_hist} pred_hist={pred_hist} "
-                            f"logits_mean={logits_mean:.4f} logits_std={logits_std:.4f} "
+                            f"logits_mean={logit_mean:.4f} logits_std={logit_std:.4f} "
                             f"true_prob_mean={true_prob:.4f} top_prob_mean={top_pred_prob:.4f} "
                             f"grad_norm={grad_norm:.4f}"
                         )
                         await self._emit_log("DEBUG", msg)
                         zero_acc_logs += 1
-
+    
                     self._apply_updates(
                         model,
                         grads,
@@ -1261,14 +1315,14 @@ class TrainingService:
                         learnable_logit_scale=logit_scale_learnable,
                         logit_scale_grad=logit_scale_grad,
                     )
-
+    
                     step_duration = max(time.perf_counter() - step_start, 1e-6)
                     throughput = float(batch_x.shape[0] / step_duration)
                     batch_throughputs.append(throughput)
-
+    
                     ema_loss = loss if ema_loss is None else ema_decay * ema_loss + (1 - ema_decay) * loss
                     ema_acc = batch_acc if ema_acc is None else ema_decay * ema_acc + (1 - ema_decay) * batch_acc
-
+    
                     batch_fp_config = FixedPointConfig(
                         iterations=epoch_k_limit,
                         tolerance=tolerance,
@@ -1287,16 +1341,20 @@ class TrainingService:
                         timesteps,
                         batch_fp_config,
                     )
-
+    
                     if use_residual_metric and batch_size_actual > 0:
                         epoch_residuals.append(residual_value)
-
+    
                     metrics_payload = {
+                        "phase": "train",
                         "epoch": epoch,
                         "step": step + 1,
                         "loss": loss,
+                        "nll": loss,
                         "acc": batch_acc,
                         "top5": top5_acc,
+                        "conf": confidence,
+                        "entropy": entropy,
                         "throughput": throughput,
                         "step_ms": step_duration * 1000.0,
                         "ema_loss": ema_loss,
@@ -1304,6 +1362,9 @@ class TrainingService:
                         "lr": current_lr,
                         "temperature": temperature,
                         "logit_scale": model.logit_scale,
+                        "logit_mean": logit_mean,
+                        "logit_std": logit_std,
+                        "s_rate": 0.0,
                         "residual": residual_value,
                         "k": actual_iters,
                         "max_k": epoch_k_limit,
@@ -1318,16 +1379,16 @@ class TrainingService:
                         "max_k": epoch_k_limit,
                         "layer": step % layers_count,
                         "residual": residual_value,
-                        "solver": "anderson",
+                        "solver": solver,
                         "k_bin": epoch_bin,
                         "time_unix": _current_millis(),
                     }
-
+    
                     await self._broker.publish("train_iter", iter_payload)
                     await self._broker.publish("metrics_batch", metrics_payload)
                     if spike_payload is not None:
                         await self._broker.publish("spike", spike_payload)
-
+    
                     ema_loss_str = f"{ema_loss:.4f}" if ema_loss is not None else "nan"
                     ema_acc_str = f"{ema_acc:.4f}" if ema_acc is not None else "nan"
                     logger.info(
@@ -1345,27 +1406,47 @@ class TrainingService:
                         current_lr,
                         batch_x.shape[0],
                     )
-
+    
                     if step % 10 == 0:
                         await asyncio.sleep(0)
-
-                val_loss, val_acc, val_top5 = self._evaluate(
-                    model, dataset.val_x, dataset.val_y, kernel, temperature, batch_size=512
-                )
+    
+                (
+                    val_loss,
+                    val_acc,
+                    val_top5,
+                    val_conf,
+                    val_entropy,
+                    val_logit_mean,
+                    val_logit_std,
+                ) = self._evaluate(model, dataset.val_x, dataset.val_y, kernel, temperature, batch_size=512)
                 best_acc = max(best_acc, val_acc)
                 best_loss = min(best_loss, val_loss)
                 epoch_duration = time.perf_counter() - epoch_start
                 avg_throughput = float(np.mean(batch_throughputs)) if batch_throughputs else None
-                train_loss_epoch = epoch_loss_total / max(epoch_examples, 1)
-                train_acc_epoch = epoch_acc_total / max(epoch_examples, 1)
+                denom = max(epoch_examples, 1)
+                train_loss_epoch = epoch_loss_total / denom
+                train_acc_epoch = epoch_acc_total / denom
+                train_conf_epoch = epoch_conf_total / denom
+                train_entropy_epoch = epoch_entropy_total / denom
+                if epoch_logit_count > 0:
+                    train_logit_mean = epoch_logit_sum / epoch_logit_count
+                    train_logit_var = max(epoch_logit_sq_sum / epoch_logit_count - train_logit_mean ** 2, 0.0)
+                    train_logit_std = math.sqrt(train_logit_var)
+                else:
+                    train_logit_mean = 0.0
+                    train_logit_std = 0.0
                 residual_mean = (
                     float(np.mean(epoch_residuals)) if use_residual_metric and epoch_residuals else None
                 )
-
+    
                 epoch_payload = {
+                    "phase": "val",
                     "epoch": epoch,
                     "loss": val_loss,
+                    "nll": val_loss,
                     "acc": val_acc,
+                    "conf": val_conf,
+                    "entropy": val_entropy,
                     "best_acc": best_acc,
                     "best_loss": best_loss,
                     "avg_throughput": avg_throughput,
@@ -1374,13 +1455,22 @@ class TrainingService:
                     "time_unix": _current_millis(),
                     "train_loss": train_loss_epoch,
                     "train_acc": train_acc_epoch,
+                    "train_conf": train_conf_epoch,
+                    "train_entropy": train_entropy_epoch,
+                    "train_s_rate": 0.0,
                     "temperature": temperature,
                     "logit_scale": model.logit_scale,
+                    "logit_mean": val_logit_mean,
+                    "logit_std": val_logit_std,
+                    "train_logit_mean": train_logit_mean,
+                    "train_logit_std": train_logit_std,
+                    "s_rate": 0.0,
+                    "rate_target": config.get("rate_target", 0.0),
                 }
                 if residual_mean is not None:
                     epoch_payload["residual"] = residual_mean
                 await self._broker.publish("metrics_epoch", epoch_payload)
-
+    
                 avg_tps_str = f"{avg_throughput:.1f}" if avg_throughput is not None else "nan"
                 residual_str = f"{residual_mean:.6f}" if residual_mean is not None else "n/a"
                 logger.info(
@@ -1398,14 +1488,25 @@ class TrainingService:
                     val_top5,
                     residual_str,
                 )
-
+    
                 log_metric: Dict[str, Any] = {
                     "train_loss": train_loss_epoch,
                     "train_acc": train_acc_epoch,
+                    "train_conf": train_conf_epoch,
+                    "train_entropy": train_entropy_epoch,
+                    "train_s_rate": 0.0,
+                    "train_logit_mean": train_logit_mean,
+                    "train_logit_std": train_logit_std,
                     "val_loss": val_loss,
                     "val_acc": val_acc,
+                    "val_conf": val_conf,
+                    "val_entropy": val_entropy,
+                    "val_s_rate": 0.0,
+                    "val_logit_mean": val_logit_mean,
+                    "val_logit_std": val_logit_std,
                     "temperature": temperature,
                     "logit_scale": model.logit_scale,
+                    "rate_target": config.get("rate_target", 0.0),
                 }
                 if avg_throughput is not None:
                     log_metric["avg_throughput"] = avg_throughput
@@ -1414,7 +1515,9 @@ class TrainingService:
                 log_message = (
                     f"[epoch {epoch}/{epochs}] "
                     f"train_loss={train_loss_epoch:.4f} train_acc={train_acc_epoch:.4f} "
-                    f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+                    f"train_conf={train_conf_epoch:.4f} val_loss={val_loss:.4f} "
+                    f"val_acc={val_acc:.4f} val_conf={val_conf:.4f} "
+                    f"rate=0.000->{config.get('rate_target', 0.0):.2f}"
                 )
                 log_message += (
                     f" residual={residual_mean:.6f}" if residual_mean is not None else " residual=n/a"
@@ -1423,11 +1526,11 @@ class TrainingService:
                     f" avg_throughput={avg_throughput:.2f}" if avg_throughput is not None else " avg_throughput=n/a"
                 )
                 await self._emit_log("INFO", log_message, metric=log_metric, subject="snn.ui.log.training")
-
+    
                 if self._stop_event.is_set():
                     await self._broker.publish("train_status", {"status": "Stopped", "time_unix": _current_millis()})
                     return
-
+    
             await self._broker.publish(
                 "log",
                 {"level": "INFO", "msg": "训练完成", "time_unix": _current_millis()},
@@ -1620,8 +1723,13 @@ class TrainingService:
         learnable_logit_scale: bool = False,
         logit_scale_grad: Optional[float] = None,
     ) -> None:
-        if weight_decay > 0:
-            model.W_basal *= (1.0 - lr * weight_decay)
+        if weight_decay > 0.0 and lr > 0.0:
+            decay = max(0.0, 1.0 - lr * weight_decay)
+            model.W_basal *= decay
+            model.b_basal *= decay
+            model.b_out *= decay
+            if learnable_logit_scale:
+                model.logit_scale = float(model.logit_scale * decay)
         model.W_basal -= lr * grads["W_basal"]
         model.b_basal -= lr * grads["b_basal"]
         model.b_out -= lr * grads["b_out"]
@@ -1730,11 +1838,16 @@ class TrainingService:
         kernel: np.ndarray,
         temperature: float,
         batch_size: int = 512,
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[float, float, float, float, float, float, float]:
         total = inputs.shape[0]
         losses: List[float] = []
         accs: List[float] = []
         top5_list: List[float] = []
+        conf_sum = 0.0
+        entropy_sum = 0.0
+        logit_sum = 0.0
+        logit_sq_sum = 0.0
+        logit_count = 0
         for start in range(0, total, batch_size):
             end = start + batch_size
             batch_x = inputs[start:end]
@@ -1747,10 +1860,30 @@ class TrainingService:
             accs.append(float(np.mean(pred == batch_y)))
             top5_hits = np.any(np.argsort(probs, axis=1)[:, -5:] == batch_y[:, None], axis=1)
             top5_list.append(float(np.mean(top5_hits)))
+            batch_size_actual = batch_x.shape[0]
+            probs_safe = np.clip(probs, 1e-12, 1.0)
+            entropy = (
+                float(np.mean(-np.sum(probs_safe * np.log(probs_safe), axis=1))) if probs.size else 0.0
+            )
+            confidence = (
+                float(np.mean(probs[np.arange(batch_y.shape[0]), batch_y])) if batch_y.size else 0.0
+            )
+            conf_sum += confidence * batch_size_actual
+            entropy_sum += entropy * batch_size_actual
+            logit_sum += float(np.sum(logits))
+            logit_sq_sum += float(np.sum(logits ** 2))
+            logit_count += logits.size
         avg_loss = float(np.mean(losses)) if losses else 0.0
         avg_acc = float(np.mean(accs)) if accs else 0.0
         avg_top5 = float(np.mean(top5_list)) if top5_list else 0.0
-        return avg_loss, avg_acc, avg_top5
+        denom = max(total, 1)
+        avg_conf = conf_sum / denom
+        avg_entropy = entropy_sum / denom
+        logit_count = max(logit_count, 1)
+        logit_mean = logit_sum / logit_count
+        logit_var = max(logit_sq_sum / logit_count - logit_mean ** 2, 0.0)
+        logit_std = math.sqrt(logit_var)
+        return avg_loss, avg_acc, avg_top5, avg_conf, avg_entropy, logit_mean, logit_std
 
 
 def _build_broker(message_queue_config: Optional[Dict[str, Any]]) -> Tuple[EventBroker, MessageQueue]:

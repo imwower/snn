@@ -62,6 +62,14 @@ class ServerInterfaceTests(unittest.TestCase):
             self.assertIn("train_init", event_names)
             self.assertIn("metrics_batch", event_names)
             self.assertIn("metrics_epoch", event_names)
+            # ensure scheduler preview logging matches actual batch lr
+            log_events = [payload for name, payload in events if name == "log"]
+            epoch_logs = [entry for entry in log_events if "开始 epoch" in entry.get("msg", "")]
+            self.assertTrue(epoch_logs, "缺少 epoch 启动日志")
+            logged_lr_text = epoch_logs[0]["msg"].split("lr=")[1].split()[0]
+            logged_lr = float(logged_lr_text)
+            first_batch = next(payload for name, payload in events if name == "metrics_batch")
+            self.assertAlmostEqual(logged_lr, first_batch["lr"], places=9)
             status_updates = [payload.get("status") for name, payload in events if name == "train_status"]
             self.assertIn("Training", status_updates)
             self.assertIn("Idle", status_updates)

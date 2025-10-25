@@ -159,6 +159,8 @@ def fixed_point_parallel_solve(
         damping,
     )
 
+    stalled_steps = 0
+
     for iteration in range(1, config.iterations + 1):
         prev_soma = soma[:]
         prev_apical = apical_state[:]
@@ -230,6 +232,22 @@ def fixed_point_parallel_solve(
         if residual <= config.tolerance:
             logger.info("残差 %.3e 已低于阈值 %.3e，提前停止迭代", residual, config.tolerance)
             break
+
+        if len(residuals) >= 2:
+            prev_residual = residuals[-2]
+            if prev_residual > 0.0:
+                drop_ratio = (prev_residual - residual) / max(prev_residual, 1e-12)
+            else:
+                drop_ratio = 1.0 if residual < prev_residual else 0.0
+            if drop_ratio < 0.02:
+                stalled_steps += 1
+            else:
+                stalled_steps = 0
+            if stalled_steps >= 2:
+                logger.info("残差下降比例连续两步低于 2%%，提前停止迭代")
+                break
+        else:
+            stalled_steps = 0
 
     times = [dt * (idx + 1.0) for idx in range(steps)]
     spike_flags = [value >= params.threshold for value in soma]

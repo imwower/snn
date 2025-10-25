@@ -70,6 +70,7 @@ class HyperParams:
     anderson_m: int = 4
     anderson_beta: float = 0.5
     K_schedule: Optional[str] = None
+    logit_scale: float = 1.0
     rate_reg_lambda: float = 0.0
     rate_target: float = 0.0
     g_apical_start: float = 0.5
@@ -205,6 +206,11 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
     grad_clip_value = float(grad_clip_raw) if grad_clip_raw is not None else None
     if grad_clip_value is not None and grad_clip_value <= 0:
         grad_clip_value = None
+    logit_raw = hyper_raw.get("logit_scale", 1.0)
+    if isinstance(logit_raw, dict):
+        logit_scale_value = float(logit_raw.get("value", 1.0))
+    else:
+        logit_scale_value = float(logit_raw)
     rate_lambda = float(hyper_raw.get("rate_reg_lambda", 0.0))
     rate_target = float(hyper_raw.get("rate_target", 0.0))
     reg_block = hyper_raw.get("tstep_regularization")
@@ -257,6 +263,7 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         anderson_m=anderson_m_value,
         anderson_beta=anderson_beta_value,
         K_schedule=k_schedule_value,
+        logit_scale=max(1e-9, logit_scale_value),
         rate_reg_lambda=max(0.0, rate_lambda),
         rate_target=rate_target,
         g_apical_start=g_apical_start,
@@ -391,14 +398,12 @@ def nll_from_logits(logits: np.ndarray, targets: np.ndarray) -> Tuple[float, np.
     shifted = logits64 - max_logits
     exp_shifted = np.exp(shifted, dtype=np.float64)
     denom = np.clip(np.sum(exp_shifted, axis=1, keepdims=True), 1e-12, None)
-    probs64 = exp_shifted / denom
-    probs = probs64.astype(logits.dtype, copy=False)
+    log_probs = shifted - np.log(denom)
+    probs = np.exp(log_probs).astype(logits.dtype, copy=False)
     if targets.size == 0:
         return 0.0, probs
-    logsum = np.log(denom)
     row_idx = np.arange(targets.shape[0])
-    target_shifted = shifted[row_idx, targets]
-    log_prob_targets = target_shifted - logsum[:, 0]
+    log_prob_targets = log_probs[row_idx, targets]
     nll_values = -log_prob_targets
     loss = float(np.mean(nll_values)) if nll_values.size else 0.0
     return loss, probs
@@ -427,8 +432,7 @@ def classification_stats(probs: np.ndarray, targets: np.ndarray) -> Tuple[float,
     classes = probs.shape[1]
     k = min(5, classes)
     if k > 0:
-        kth_index = max(classes - k, 0)
-        partition = np.argpartition(probs, kth_index, axis=1)[:, -k:]
+        partition = np.argpartition(-probs, k - 1, axis=1)[:, :k]
         hits = np.any(partition == targets[:, None], axis=1)
         top5 = float(np.mean(hits))
     else:
@@ -652,6 +656,8 @@ class TrainStepResult:
     residual: Optional[float] = None
     iterations: Optional[int] = None
     s_rate: Optional[float] = None
+    logit_mean: Optional[float] = None
+    logit_std: Optional[float] = None
 
 
 class Trainer:
@@ -670,6 +676,7 @@ class Trainer:
         self.rate_target = float(self.cfg.hyper.rate_target)
         self.g_apical_start = float(self.cfg.hyper.g_apical_start)
         self.g_apical_end = float(self.cfg.hyper.g_apical_end)
+        self.logit_scale = float(self.cfg.hyper.logit_scale)
         self.beta_start = self.cfg.hyper.beta_start
         self.beta_end = self.cfg.hyper.beta_end
         self.v_th_start = self.cfg.hyper.v_th_start
@@ -680,6 +687,7 @@ class Trainer:
         self._base_threshold = self.model.neuron.threshold
         self._spectral_rng = np.random.default_rng(self.cfg.hyper.seed)
         self._spectral_vec: Optional[np.ndarray] = None
+        self._probe_interval = 1  # log every batch for quick diagnosis
 
     @property
     def temperature(self) -> float:
@@ -731,6 +739,44 @@ class Trainer:
             raise ValueError("soma history must include at least one timestep")
         soma_stack = np.stack(h_list[1:], axis=0)
         return np.mean(soma_stack, axis=0)
+
+    def _scale_output_features(self, features: np.ndarray) -> np.ndarray:
+        if self.logit_scale == 1.0:
+            return features
+        return features * self.logit_scale
+
+    def _truth_probe(
+        self,
+        logits: np.ndarray,
+        probs: np.ndarray,
+        *,
+        top1: float,
+        top5: float,
+        confidence: float,
+        entropy: float,
+        s_rate: Optional[float],
+    ) -> Tuple[float, float]:
+        if logits.size == 0:
+            LOGGER.debug("[probe] empty logits tensor; skipping stats")
+            return 0.0, 0.0
+        logit_std = float(np.std(logits))
+        logit_mean = float(np.mean(logits))
+        message = (
+            "[probe] logit_std=%.4e logit_mean=%.4e conf=%.4f entropy=%.4f "
+            "top1=%.4f top5=%.4f"
+        ) % (logit_std, logit_mean, confidence, entropy, top1, top5)
+        if s_rate is not None:
+            message += f" s_rate={s_rate:.4f}"
+        LOGGER.debug(message)
+        if not np.isfinite(logit_std) or not np.isfinite(logit_mean):
+            raise AssertionError("logit statistics became non-finite")
+        if not np.isfinite(confidence) or not np.isfinite(entropy):
+            raise AssertionError("probability statistics became non-finite")
+        if probs.size and (
+            np.min(probs) < -1e-6 or np.max(probs) > 1.0 + 1e-6 or not np.all(np.isfinite(probs))
+        ):
+            raise AssertionError("probabilities outside [0,1] or non-finite")
+        return logit_mean, logit_std
 
     def _estimate_spectral_norm(self, matrix: np.ndarray, iterations: int = 6) -> float:
         if matrix.size == 0:
@@ -794,7 +840,9 @@ class Trainer:
             threshold_override=threshold_override,
         )
         features = self._mean_soma_states(h_list)
-        pre_logits = features @ self.model.Wo.T + self.model.bo
+        s_rate = float(np.mean(features)) if features.size else 0.0
+        scaled_features = self._scale_output_features(features)
+        pre_logits = scaled_features @ self.model.Wo.T + self.model.bo
         temp_value = self.temperature
         logits = pre_logits / temp_value
         if logits.ndim != 2 or logits.shape[1] != num_classes:
@@ -802,6 +850,15 @@ class Trainer:
 
         nll, probs = nll_from_logits(logits, batch_y)
         acc, top5, confidence, entropy = classification_stats(probs, batch_y)
+        logit_mean, logit_std = self._truth_probe(
+            logits,
+            probs,
+            top1=acc,
+            top5=top5,
+            confidence=confidence,
+            entropy=entropy,
+            s_rate=s_rate,
+        )
         row_sums = np.sum(probs, axis=1)
         if not np.all(np.isfinite(row_sums)) or np.max(np.abs(row_sums - 1.0)) > 1e-4:
             raise ValueError("probabilities must sum to 1 per row")
@@ -820,7 +877,7 @@ class Trainer:
         grad_logits /= max(batch_y.shape[0], 1)
 
         grad_pre = grad_logits / temp_value
-        grad_Wo = grad_pre.T @ features
+        grad_Wo = grad_pre.T @ scaled_features
         grad_bo = np.sum(grad_pre, axis=0)
         temp_grad_arr = None
         if self.learnable_temperature:
@@ -852,6 +909,8 @@ class Trainer:
             spikes_total=total_spikes,
             spikes_per_neuron=per_neuron,
             s_rate=s_rate,
+            logit_mean=logit_mean,
+            logit_std=logit_std,
         )
 
     def _train_step_fpt(
@@ -868,7 +927,7 @@ class Trainer:
         if batch_y.size > 0:
             assert int(batch_y.min()) >= 0 and int(batch_y.max()) < num_classes, "labels out of range"
 
-        pre_logits, h_list, _, _, spikes = self._forward_batch(
+        _, h_list, _, _, spikes = self._forward_batch(
             batch_x,
             apical_coupling_override=apical_coupling,
             beta_override=beta_override,
@@ -877,11 +936,23 @@ class Trainer:
         s_mean = self._mean_soma_states(h_list)
         s_rate = float(np.mean(s_mean)) if s_mean.size else 0.0
         temp_value = self.temperature
+        final_state = h_list[-1]
+        scaled_state = self._scale_output_features(final_state)
+        pre_logits = scaled_state @ self.model.Wo.T + self.model.bo
         logits = pre_logits / temp_value
         assert logits.shape[1] == num_classes, "logit dimension mismatch"
 
         nll, probs = nll_from_logits(logits, batch_y)
         acc, top5, confidence, entropy = classification_stats(probs, batch_y)
+        logit_mean, logit_std = self._truth_probe(
+            logits,
+            probs,
+            top1=acc,
+            top5=top5,
+            confidence=confidence,
+            entropy=entropy,
+            s_rate=s_rate,
+        )
         loss = nll
         if self.rate_reg_lambda > 0.0:
             rate_error = s_rate - self.rate_target
@@ -919,7 +990,7 @@ class Trainer:
                 h_prev = h_current.copy()
                 # compute next h via plain update
                 grad_tmp = grad_logits / temp_value
-                grad_h = grad_tmp @ self.model.Wo
+                grad_h = (grad_tmp @ self.model.Wo) * self.logit_scale
                 grad_basal = np.zeros_like(grad_h)
                 grad_apical = np.zeros_like(grad_h)
                 grad_Wxh = np.zeros_like(self.model.Wxh)
@@ -964,10 +1035,10 @@ class Trainer:
             truncation = max_steps
 
         grad_pre = grad_logits / temp_value
-        grad_Wo = grad_pre.T @ h_list[-1]
+        grad_Wo = grad_pre.T @ scaled_state
         grad_bo = np.sum(grad_pre, axis=0)
 
-        grad_h = grad_pre @ self.model.Wo
+        grad_h = (grad_pre @ self.model.Wo) * self.logit_scale
         grad_basal = np.zeros_like(grad_h)
         grad_apical = np.zeros_like(grad_h)
 
@@ -1050,6 +1121,8 @@ class Trainer:
             spikes_per_neuron=per_neuron,
             residual=residual_value,
             s_rate=s_rate,
+            logit_mean=logit_mean,
+            logit_std=logit_std,
         )
 
     def evaluate(
@@ -1061,19 +1134,22 @@ class Trainer:
         apical_coupling: Optional[float] = None,
         beta_override: Optional[float] = None,
         threshold_override: Optional[float] = None,
-    ) -> Tuple[float, float, float, float, float]:
+    ) -> Tuple[float, float, float, float, float, float, float]:
         total_loss = 0.0
         total_acc = 0.0
         total_top5 = 0.0
         total_conf = 0.0
         total_entropy = 0.0
+        logit_sum = 0.0
+        logit_sq_sum = 0.0
+        logit_count = 0
         count = 0
         temp_value = self.temperature
         for start in range(0, data_x.shape[0], batch_size):
             end = start + batch_size
             batch_x = data_x[start:end]
             batch_y = data_y[start:end]
-            logits, h_list, _, _, _ = self._forward_batch(
+            _, h_list, _, _, _ = self._forward_batch(
                 batch_x,
                 apical_coupling_override=apical_coupling,
                 beta_override=beta_override,
@@ -1081,7 +1157,12 @@ class Trainer:
             )
             if self.cfg.mode == "tstep":
                 features = self._mean_soma_states(h_list)
-                logits = features @ self.model.Wo.T + self.model.bo
+                scaled_features = self._scale_output_features(features)
+                logits = scaled_features @ self.model.Wo.T + self.model.bo
+            else:
+                final_state = h_list[-1]
+                scaled_state = self._scale_output_features(final_state)
+                logits = scaled_state @ self.model.Wo.T + self.model.bo
             logits = logits / temp_value
             loss, probs = nll_from_logits(logits, batch_y)
             acc, top5, confidence, entropy = classification_stats(probs, batch_y)
@@ -1091,14 +1172,23 @@ class Trainer:
             total_top5 += top5 * batch_count
             total_conf += confidence * batch_count
             total_entropy += entropy * batch_count
+            logit_sum += float(np.sum(logits))
+            logit_sq_sum += float(np.sum(logits ** 2))
+            logit_count += logits.size
             count += batch_count
         denom = max(count, 1)
+        logit_count = max(logit_count, 1)
+        logit_mean = logit_sum / logit_count
+        logit_var = max(logit_sq_sum / logit_count - logit_mean ** 2, 0.0)
+        logit_std = math.sqrt(logit_var)
         return (
             total_loss / denom,
             total_acc / denom,
             total_top5 / denom,
             total_conf / denom,
             total_entropy / denom,
+            logit_mean,
+            logit_std,
         )
 
     def train_batch(
@@ -1168,9 +1258,14 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
             epoch_top5 = 0.0
             epoch_conf = 0.0
             epoch_entropy = 0.0
+            epoch_rate_sum = 0.0
+            epoch_rate_count = 0
             epoch_examples = 0
             epoch_throughputs: List[float] = []
             epoch_residuals: List[float] = []
+            epoch_logit_sum = 0.0
+            epoch_logit_sq_sum = 0.0
+            epoch_logit_count = 0
             if epochs <= 1:
                 progress = 1.0
             else:
@@ -1218,6 +1313,16 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 epoch_throughputs.append(throughput)
                 if result.residual is not None:
                     epoch_residuals.append(result.residual)
+                if result.logit_mean is not None and result.logit_std is not None:
+                    logits_per_batch = batch_size * worker_cfg.network.output_dim
+                    epoch_logit_sum += result.logit_mean * logits_per_batch
+                    epoch_logit_sq_sum += (
+                        (result.logit_std ** 2 + result.logit_mean ** 2) * logits_per_batch
+                    )
+                    epoch_logit_count += logits_per_batch
+                if result.s_rate is not None:
+                    epoch_rate_sum += float(result.s_rate) * batch_size
+                    epoch_rate_count += batch_size
 
                 if global_step % 10 == 0:
                     metrics_payload: Dict[str, Any] = {
@@ -1241,6 +1346,11 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                     if result.residual is not None:
                         metrics_payload["residual"] = result.residual
                     metrics_payload["s_rate"] = float(result.s_rate) if result.s_rate is not None else 0.0
+                    metrics_payload["rate_target"] = trainer.rate_target
+                    if result.logit_mean is not None:
+                        metrics_payload["logit_mean"] = result.logit_mean
+                    if result.logit_std is not None:
+                        metrics_payload["logit_std"] = result.logit_std
                     spikes_payload = {
                         "epoch": epoch + 1,
                         "step": global_step,
@@ -1261,7 +1371,23 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
             train_avg_top5 = epoch_top5 / denom
             train_avg_conf = epoch_conf / denom
             train_avg_entropy = epoch_entropy / denom
-            val_loss, val_acc, val_top5, val_conf, val_entropy = trainer.evaluate(
+            train_avg_rate = epoch_rate_sum / max(epoch_rate_count, 1)
+            if epoch_logit_count > 0:
+                train_logit_mean = epoch_logit_sum / epoch_logit_count
+                train_logit_var = max(epoch_logit_sq_sum / epoch_logit_count - train_logit_mean ** 2, 0.0)
+                train_logit_std = math.sqrt(train_logit_var)
+            else:
+                train_logit_mean = 0.0
+                train_logit_std = 0.0
+            (
+                val_loss,
+                val_acc,
+                val_top5,
+                val_conf,
+                val_entropy,
+                val_logit_mean,
+                val_logit_std,
+            ) = trainer.evaluate(
                 val_x,
                 val_y,
                 worker_cfg.hyper.batch_size,
@@ -1291,12 +1417,18 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 "train_top5": train_avg_top5,
                 "train_conf": train_avg_conf,
                 "train_entropy": train_avg_entropy,
+                "train_s_rate": train_avg_rate,
+                "train_logit_mean": train_logit_mean,
+                "train_logit_std": train_logit_std,
                 "mode": worker_cfg.mode,
                 "avg_throughput": avg_throughput,
                 "time_unix": current_millis(),
             }
             if residual_mean is not None:
                 metrics_payload["residual"] = residual_mean
+            metrics_payload["logit_mean"] = val_logit_mean
+            metrics_payload["logit_std"] = val_logit_std
+            metrics_payload["rate_target"] = trainer.rate_target
             await publisher.publish_json(worker_cfg.nats.subjects.metrics, metrics_payload)
 
             log_metric = {
@@ -1306,11 +1438,17 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 "train_top5": train_avg_top5,
                 "train_conf": train_avg_conf,
                 "train_entropy": train_avg_entropy,
+                "train_s_rate": train_avg_rate,
+                "train_logit_mean": train_logit_mean,
+                "train_logit_std": train_logit_std,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
                 "val_top5": val_top5,
                 "val_conf": val_conf,
                 "val_entropy": val_entropy,
+                "val_logit_mean": val_logit_mean,
+                "val_logit_std": val_logit_std,
+                "rate_target": trainer.rate_target,
             }
             if avg_throughput is not None:
                 log_metric["avg_throughput"] = avg_throughput
@@ -1322,7 +1460,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                     f"[epoch {epoch + 1}/{epochs}] mode={worker_cfg.mode} "
                     f"train_loss={train_avg_loss:.4f} train_acc={train_avg_acc:.4f} train_top5={train_avg_top5:.4f} "
                     f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_top5={val_top5:.4f} "
-                    f"conf={val_conf:.4f} entropy={val_entropy:.4f}"
+                    f"conf={val_conf:.4f} entropy={val_entropy:.4f} rate={train_avg_rate:.3f}->{trainer.rate_target:.2f}"
                     + (f" residual={residual_mean:.6f}" if residual_mean is not None else "")
                     + (f" avg_throughput={avg_throughput:.2f}" if avg_throughput is not None else "")
                 ),
