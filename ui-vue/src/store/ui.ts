@@ -68,7 +68,7 @@ type FinalSummary = {
 const buildLayout = (cfg: TrainingConfig): LayerLayout[] => {
   const layers: LayerLayout[] = [];
   const perLayer = Math.max(1, Math.ceil(cfg.network_size / Math.max(1, cfg.layers)));
-  const layerSpacing = 6;
+  const layerSpacing = 12;
   const gridSpacing = 1.4;
 
   for (let layerIndex = 0; layerIndex < cfg.layers; layerIndex += 1) {
