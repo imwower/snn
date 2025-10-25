@@ -29,31 +29,33 @@ training_worker:
     epochs: 10
     batch_size: 64
     lr: 0.001
+    scheduler:
+      type: cosine
+      warmup_steps: 100
     weight_decay: 0.0
     truncation_steps: 4
     timesteps: 16
     seed: 42
-    warmup_steps: 100
     grad_clip: 1.0
-    temperature: 1.0
-    temperature_learnable: false
-    solver: anderson
-    anderson_m: 4
-    anderson_beta: 0.5
-    K_schedule: auto
+    temperature:
+      value: 1.0
+      learnable: false
+    logit_scale:
+      value: 1.0
+      learnable: false
+    solver:
+      type: anderson
+      anderson_m: 4
+      anderson_beta: 0.5
+      K_schedule: auto
     rate_reg_lambda: 0.0
     rate_target: 0.1
+    tstep_regularization:
+      rate_reg_lambda: 0.0
+      rate_target: 0.1
     g_apical:
       start: 0.5
       end: 0.2
-    solver: anderson
-    anderson_m: 4
-    anderson_beta: 0.5
-    warmup_steps: 100
-    grad_clip: 1.0
-    temperature: 1.0
-    temperature_learnable: false
-    K_schedule: null
   neuron:
     dt: 0.001
     tau_soma: 0.02
@@ -72,3 +74,32 @@ training_worker:
       metrics: snn.metrics.training
       spikes: snn.spikes.layer
       logs: snn.ui.log.training
+
+training_service:
+  dataset: MNIST
+  mode: fpt
+  network_size: 128
+  layers: 2
+  epochs: 20
+  lr: 0.001
+  scheduler:
+    type: cosine
+    warmup_steps: 200
+    min_lr_scale: 0.1
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  K: 4
+  tol: 1.0e-5
+  T: 12
+  solver:
+    type: anderson
+    anderson_m: 4
+    anderson_beta: 0.5
+    K_schedule: auto
+  temperature: 1.0
+  logit_scale:
+    value: 1.0
+    learnable: false
+  tstep_regularization:
+    rate_reg_lambda: 0.0
+    rate_target: 0.1

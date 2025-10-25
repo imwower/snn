@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import gzip
 import json
 import logging
@@ -45,6 +46,41 @@ def _current_millis() -> int:
     return int(time.time() * 1000)
 
 
+def _cosine_with_warmup(step: int, base_lr: float, warmup_steps: int, total_steps: int, min_lr: float) -> float:
+    if total_steps <= 0:
+        return base_lr
+    clamped_step = max(0, min(step, total_steps))
+    if warmup_steps > 0 and clamped_step < warmup_steps:
+        return base_lr * float(clamped_step) / float(max(1, warmup_steps))
+    remaining = max(1, total_steps - warmup_steps)
+    progress = (clamped_step - warmup_steps) / float(remaining)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
+def _clip_gradients_inplace(
+    grads: Dict[str, np.ndarray],
+    max_norm: float,
+    extra: Optional[Dict[str, np.ndarray]] = None,
+) -> float:
+    total = 0.0
+    for grad in grads.values():
+        total += float(np.sum(np.square(grad)))
+    if extra:
+        for value in extra.values():
+            total += float(np.sum(np.square(value)))
+    norm = math.sqrt(max(total, 0.0))
+    if max_norm > 0.0 and math.isfinite(norm) and norm > max_norm:
+        scale = max_norm / (norm + 1e-12)
+        for key in grads.keys():
+            grads[key] *= scale
+        if extra:
+            for key in extra.keys():
+                extra[key] *= scale
+    return norm
+
+
 HandlerFn = Callable[[Message], Awaitable[None]]
 
 
@@ -62,6 +98,9 @@ class TrainingInitRequest(BaseModel):
     anderson_m: int = Field(default=4, ge=1, description="Anderson 深度")
     anderson_beta: float = Field(default=0.5, ge=0.0, le=1.0, description="Anderson 阻尼")
     K_schedule: Optional[str] = Field(default=None, description="可选的 K 调度策略（如 auto）")
+    temperature: float = Field(default=1.0, gt=0.0, description="Logit temperature 缩放系数")
+    logit_scale: float = Field(default=1.0, gt=0.0, description="Logit 幅度缩放系数")
+    logit_scale_learnable: bool = Field(default=False, description="logit_scale 是否作为可学习参数")
 
 
 class DatasetDownloadRequest(BaseModel):
@@ -149,6 +188,7 @@ class ModelState:
     W_basal: np.ndarray  # (num_classes, timesteps, input_dim)
     b_basal: np.ndarray  # (num_classes, timesteps)
     b_out: np.ndarray    # (num_classes,)
+    logit_scale: float
 
 
 def _read_idx_images(path: Path) -> np.ndarray:
@@ -762,12 +802,12 @@ class DatasetService:
 class TrainingService:
     """使用三隔室神经元 + 固定点求解器的训练服务。"""
 
-    def __init__(self, broker: EventBroker) -> None:
+    def __init__(self, broker: EventBroker, defaults: Optional[Dict[str, Any]] = None) -> None:
         self._broker = broker
         self._rng = random.Random(42)
         self._lock = asyncio.Lock()
         self._status: str = "Idle"
-        self._config: Dict[str, Any] = {
+        base_config: Dict[str, Any] = {
             "dataset": "MNIST",
             "mode": "fpt",
             "network_size": 128,
@@ -781,7 +821,20 @@ class TrainingService:
             "anderson_m": 4,
             "anderson_beta": 0.5,
             "K_schedule": None,
+            "temperature": 1.0,
+            "logit_scale": 1.0,
+            "logit_scale_learnable": False,
+            "epochs": 20,
+            "warmup_steps": 0,
+            "scheduler": "cosine",
+            "min_lr": None,
+            "min_lr_scale": 0.1,
+            "weight_decay": 1e-4,
+            "grad_clip": 0.0,
+            "rate_reg_lambda": 0.0,
+            "rate_target": 0.1,
         }
+        self._config = self._apply_overrides(base_config, defaults or {})
         self._task: Optional[asyncio.Task[None]] = None
         self._stop_event = asyncio.Event()
         self._data_root = Path(__file__).resolve().parent.parent / ".data" / "datasets"
@@ -796,7 +849,83 @@ class TrainingService:
         return self._status
 
     def get_config(self) -> Dict[str, Any]:
-        return dict(self._config)
+        return copy.deepcopy(self._config)
+
+    def _apply_overrides(self, base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(base)
+        if not isinstance(overrides, dict):
+            return merged
+        simple_fields = [
+            "dataset",
+            "mode",
+            "network_size",
+            "layers",
+            "lr",
+            "K",
+            "tol",
+            "T",
+            "epochs",
+            "weight_decay",
+            "grad_clip",
+            "warmup_steps",
+            "min_lr",
+            "min_lr_scale",
+            "scheduler",
+            "solver",
+            "anderson_m",
+            "anderson_beta",
+            "K_schedule",
+            "temperature",
+            "logit_scale",
+            "logit_scale_learnable",
+            "rate_reg_lambda",
+            "rate_target",
+        ]
+        for field in simple_fields:
+            if field in overrides and not isinstance(overrides[field], dict):
+                merged[field] = overrides[field]
+
+        scheduler_block = overrides.get("scheduler")
+        if isinstance(scheduler_block, dict):
+            merged["scheduler"] = scheduler_block.get("type", scheduler_block.get("name", merged.get("scheduler", "cosine")))
+            if "warmup_steps" in scheduler_block:
+                merged["warmup_steps"] = int(scheduler_block["warmup_steps"])
+            if "min_lr" in scheduler_block:
+                merged["min_lr"] = float(scheduler_block["min_lr"])
+            if "min_lr_scale" in scheduler_block:
+                merged["min_lr_scale"] = float(scheduler_block["min_lr_scale"])
+
+        solver_block = overrides.get("solver")
+        if isinstance(solver_block, dict):
+            merged["solver"] = str(
+                solver_block.get("type", solver_block.get("name", merged.get("solver", "plain")))
+            ).lower()
+            if "anderson_m" in solver_block:
+                merged["anderson_m"] = int(solver_block["anderson_m"])
+            if "anderson_beta" in solver_block:
+                merged["anderson_beta"] = float(solver_block["anderson_beta"])
+            if "K_schedule" in solver_block or "schedule" in solver_block:
+                merged["K_schedule"] = solver_block.get("K_schedule", solver_block.get("schedule"))
+
+        logit_block = overrides.get("logit_scale")
+        if isinstance(logit_block, dict):
+            if "value" in logit_block:
+                merged["logit_scale"] = float(logit_block["value"])
+            if "learnable" in logit_block:
+                merged["logit_scale_learnable"] = bool(logit_block["learnable"])
+
+        reg_block = overrides.get("tstep_regularization")
+        if isinstance(reg_block, dict):
+            if "rate_reg_lambda" in reg_block or "lambda" in reg_block:
+                merged["rate_reg_lambda"] = float(
+                    reg_block.get("rate_reg_lambda", reg_block.get("lambda", merged["rate_reg_lambda"]))
+                )
+            if "rate_target" in reg_block or "target" in reg_block:
+                merged["rate_target"] = float(
+                    reg_block.get("rate_target", reg_block.get("target", merged["rate_target"]))
+                )
+
+        return merged
 
     async def _emit_log(
         self,
@@ -823,7 +952,7 @@ class TrainingService:
 
     async def init_training(self, payload: TrainingInitRequest) -> None:
         async with self._lock:
-            self._config = payload.model_dump()
+            self._config = self._apply_overrides(self._config, payload.model_dump())
         logger.info(
             "初始化训练参数：dataset=%s, mode=%s, epochs=%d, layers=%d, network_size=%d",
             payload.dataset,
@@ -859,6 +988,15 @@ class TrainingService:
                 "hidden": payload.network_size,
                 "layers": payload.layers,
                 "lr": payload.lr,
+                "temperature": payload.temperature,
+                "logit_scale": payload.logit_scale,
+                "logit_scale_learnable": payload.logit_scale_learnable,
+                "scheduler": self._config.get("scheduler"),
+                "warmup_steps": self._config.get("warmup_steps"),
+                "weight_decay": self._config.get("weight_decay"),
+                "grad_clip": self._config.get("grad_clip"),
+                "rate_reg_lambda": self._config.get("rate_reg_lambda"),
+                "rate_target": self._config.get("rate_target"),
                 "time_unix": _current_millis(),
             },
         )
@@ -889,6 +1027,13 @@ class TrainingService:
 
     async def _run_training(self) -> None:
         config = self.get_config()
+        train_cfg = config.get("train") if isinstance(config.get("train"), dict) else None
+
+        def _train_param(key: str, default: Any) -> Any:
+            if isinstance(train_cfg, dict) and key in train_cfg:
+                return train_cfg[key]
+            return config.get(key, default)
+
         dataset_name = config.get("dataset", "MNIST")
         mode_text = str(config.get("mode", "fpt")).lower()
         use_residual_metric = mode_text == "fpt"
@@ -913,13 +1058,12 @@ class TrainingService:
 
         timesteps = int(config.get("T") or 12)
         base_iterations = max(1, int(config.get("K", 3)))
-        tolerance = float(config.get("tol", 1e-5))
-        solver = str(config.get("solver", "plain")).lower()
-        anderson_m = max(1, int(config.get("anderson_m", 4)))
-        anderson_beta = float(config.get("anderson_beta", 0.5))
-        k_schedule = str(config.get("K_schedule", "") or "").lower()
-        adaptive_k = k_schedule == "auto"
-        current_iterations = base_iterations if not adaptive_k else max(1, min(base_iterations, 2))
+        tolerance = float(_train_param("tol", config.get("tol", 1e-5)))
+        solver = str(_train_param("solver", config.get("solver", "anderson"))).lower()
+        anderson_m = max(1, int(_train_param("anderson_m", config.get("anderson_m", 4))))
+        anderson_beta = float(_train_param("anderson_beta", config.get("anderson_beta", 0.5)))
+        k_schedule_raw = _train_param("K_schedule", config.get("K_schedule"))
+        k_schedule_values = self._normalize_k_schedule(k_schedule_raw, base_iterations)
         fp_kernel_config = FixedPointConfig(
             iterations=base_iterations,
             tolerance=tolerance,
@@ -928,28 +1072,42 @@ class TrainingService:
             anderson_beta=anderson_beta,
         )
         kernel = self._get_basal_kernel(timesteps, base_iterations, tolerance, self._params.dt, fp_kernel_config)
+        scheduler_name = str(config.get("scheduler", "cosine")).lower()
+        warmup_steps = int(max(0, _train_param("warmup_steps", config.get("warmup_steps", 0))))
+        grad_clip = float(max(0.0, _train_param("grad_clip", config.get("grad_clip", 0.0))))
+        base_lr = float(max(1e-6, _train_param("lr", config.get("lr", 1e-3))))
+        min_lr_override = _train_param("min_lr", config.get("min_lr"))
+        min_lr_scale = float(_train_param("min_lr_scale", config.get("min_lr_scale", 0.1)))
+        min_lr = float(max(1e-9, min_lr_override if min_lr_override is not None else base_lr * min_lr_scale))
+        weight_decay = float(max(0.0, _train_param("weight_decay", config.get("weight_decay", 1e-4))))
+        temperature = float(max(1e-6, _train_param("temperature", 1.0)))
+        initial_logit_scale = float(max(1e-6, _train_param("logit_scale", 1.0)))
+        logit_scale_learnable = bool(_train_param("logit_scale_learnable", False))
+        k_schedule_label = k_schedule_raw or "none"
+        rate_reg_value = config.get("rate_reg_lambda", "0")
         await self._emit_log(
             "INFO",
             (
-                "using solver=%s K=%d T=%d temp=%s rate_reg=%s warmup=%s grad_clip=%s"
-                % (
-                    solver,
-                    base_iterations,
-                    timesteps,
-                    config.get("temperature", "n/a"),
-                    config.get("rate_reg_lambda", "0"),
-                    config.get("warmup_steps", 0),
-                    config.get("grad_clip", 0),
-                )
+                f"using solver={solver} K={base_iterations} T={timesteps} "
+                f"temperature={temperature} K_schedule={k_schedule_label} "
+                f"scheduler={scheduler_name} warmup={warmup_steps} "
+                f"rate_reg={rate_reg_value} grad_clip={grad_clip}"
             ),
             metric={
                 "solver": solver,
                 "K": base_iterations,
                 "T": timesteps,
-                "temperature": config.get("temperature"),
+                "K_schedule": k_schedule_label,
+                "scheduler": scheduler_name,
+                "temperature": temperature,
                 "rate_reg_lambda": config.get("rate_reg_lambda"),
-                "warmup_steps": config.get("warmup_steps"),
-                "grad_clip": config.get("grad_clip"),
+                "rate_target": config.get("rate_target"),
+                "warmup_steps": warmup_steps,
+                "min_lr": min_lr,
+                "grad_clip": grad_clip,
+                "logit_scale": initial_logit_scale,
+                "logit_scale_learnable": logit_scale_learnable,
+                "weight_decay": weight_decay,
             },
         )
 
@@ -972,18 +1130,18 @@ class TrainingService:
 
         batch_size = int(np.clip(config.get("network_size", 256), 32, 256))
         layers_count = max(1, int(config.get("layers", 1)))
-        lr = float(max(1e-5, config.get("lr", 1e-3)))
         epochs = max(1, int(config.get("epochs", 1)))
         ema_decay = 0.9
-        weight_decay = 1e-4
 
-        model = self._init_model(dataset.input_dim, timesteps, num_classes, np_rng)
+        model = self._init_model(dataset.input_dim, timesteps, num_classes, np_rng, initial_logit_scale)
         self._model_state = model
 
         train_x = dataset.train_x
         train_y = dataset.train_y
         total_examples = train_x.shape[0]
         steps_per_epoch = math.ceil(total_examples / batch_size)
+        total_steps = max(1, epochs * steps_per_epoch)
+        global_step = 0
         best_acc = 0.0
         best_loss = float("inf")
         ema_loss: Optional[float] = None
@@ -998,11 +1156,14 @@ class TrainingService:
                 epoch_acc_total = 0.0
                 epoch_examples = 0
                 epoch_residuals: List[float] = []
+                epoch_bin, epoch_k_limit = self._k_limit_for_epoch(
+                    epoch, epochs, k_schedule_values, base_iterations
+                )
                 await self._emit_log(
                     "INFO",
                     (
                         f"开始 epoch={epoch}/{epochs} steps={steps_per_epoch} "
-                        f"batch_size={batch_size} lr={lr:.5f}"
+                        f"batch_size={batch_size} lr={base_lr:.5f}"
                     ),
                 )
                 zero_acc_logs = 0
@@ -1034,13 +1195,28 @@ class TrainingService:
                                 f"batch labels must be within [0, {num_classes}), got [{y_min}, {y_max}]"
                             )
 
+                    global_step += 1
+                    if scheduler_name == "cosine":
+                        current_lr = _cosine_with_warmup(global_step, base_lr, warmup_steps, total_steps, min_lr)
+                    else:
+                        if warmup_steps > 0 and global_step < warmup_steps:
+                            current_lr = base_lr * float(global_step) / float(max(1, warmup_steps))
+                        else:
+                            current_lr = base_lr
                     step_start = time.perf_counter()
-                    logits, basal_currents = self._forward_batch(model, batch_x, kernel)
-                    if logits.shape[1] != num_classes:
+                    logits_raw, basal_currents = self._forward_batch(model, batch_x, kernel)
+                    if logits_raw.shape[1] != num_classes:
                         raise AssertionError(
-                            f"logits second dimension must equal num_classes={num_classes}, got {logits.shape[1]}"
+                            f"logits second dimension must equal num_classes={num_classes}, got {logits_raw.shape[1]}"
                         )
-                    loss, probs, grad_logits = self._cross_entropy(logits, batch_y)
+                    scale_factor = model.logit_scale / temperature
+                    logits = logits_raw * scale_factor
+                    loss, probs, grad_logits_scaled = self._cross_entropy(logits, batch_y)
+                    grad_logits = grad_logits_scaled * scale_factor
+                    logit_scale_grad = None
+                    if logit_scale_learnable:
+                        inv_temp = 1.0 / temperature
+                        logit_scale_grad = float(np.sum(grad_logits_scaled * logits_raw) * inv_temp)
                     predictions = np.argmax(probs, axis=1)
                     if predictions.shape != batch_y.shape:
                         raise AssertionError("np.argmax must operate along axis=1")
@@ -1054,6 +1230,12 @@ class TrainingService:
                         epoch_examples += batch_size_actual
 
                     grads = self._compute_gradients(batch_x, grad_logits, kernel)
+                    extra_grads = None
+                    if logit_scale_grad is not None:
+                        extra_grads = {"logit_scale": np.array([logit_scale_grad], dtype=np.float32)}
+                    grad_norm = _clip_gradients_inplace(grads, grad_clip, extra_grads)
+                    if extra_grads is not None:
+                        logit_scale_grad = float(extra_grads["logit_scale"][0])
                     if batch_acc == 0.0 and zero_acc_logs < 3:
                         label_hist = np.bincount(batch_y, minlength=num_classes).tolist()
                         pred_hist = np.bincount(predictions, minlength=num_classes).tolist()
@@ -1061,7 +1243,6 @@ class TrainingService:
                         logits_std = float(np.std(logits)) if logits.size else 0.0
                         true_prob = float(np.mean(probs[np.arange(batch_y.shape[0]), batch_y])) if batch_y.size else 0.0
                         top_pred_prob = float(np.mean(np.max(probs, axis=1))) if probs.size else 0.0
-                        grad_norm = float(np.linalg.norm(grads["W_basal"]))
                         msg = (
                             f"epoch={epoch} step={step + 1} 检测到 acc=0.0："
                             f"label_hist={label_hist} pred_hist={pred_hist} "
@@ -1072,7 +1253,14 @@ class TrainingService:
                         await self._emit_log("DEBUG", msg)
                         zero_acc_logs += 1
 
-                    self._apply_updates(model, grads, lr, weight_decay)
+                    self._apply_updates(
+                        model,
+                        grads,
+                        current_lr,
+                        weight_decay,
+                        learnable_logit_scale=logit_scale_learnable,
+                        logit_scale_grad=logit_scale_grad,
+                    )
 
                     step_duration = max(time.perf_counter() - step_start, 1e-6)
                     throughput = float(batch_x.shape[0] / step_duration)
@@ -1082,7 +1270,7 @@ class TrainingService:
                     ema_acc = batch_acc if ema_acc is None else ema_decay * ema_acc + (1 - ema_decay) * batch_acc
 
                     batch_fp_config = FixedPointConfig(
-                        iterations=current_iterations,
+                        iterations=epoch_k_limit,
                         tolerance=tolerance,
                         solver=solver,
                         anderson_m=anderson_m,
@@ -1102,11 +1290,6 @@ class TrainingService:
 
                     if use_residual_metric and batch_size_actual > 0:
                         epoch_residuals.append(residual_value)
-                    if adaptive_k and use_residual_metric:
-                        if residual_value > tolerance and current_iterations < base_iterations:
-                            current_iterations += 1
-                        elif residual_value < tolerance * 0.25 and current_iterations > 1:
-                            current_iterations -= 1
 
                     metrics_payload = {
                         "epoch": epoch,
@@ -1118,9 +1301,13 @@ class TrainingService:
                         "step_ms": step_duration * 1000.0,
                         "ema_loss": ema_loss,
                         "ema_acc": ema_acc,
-                        "lr": lr,
+                        "lr": current_lr,
+                        "temperature": temperature,
+                        "logit_scale": model.logit_scale,
                         "residual": residual_value,
                         "k": actual_iters,
+                        "max_k": epoch_k_limit,
+                        "k_bin": epoch_bin,
                         "examples": int(batch_x.shape[0]),
                         "time_unix": _current_millis(),
                     }
@@ -1128,10 +1315,11 @@ class TrainingService:
                         "epoch": epoch,
                         "step": step + 1,
                         "k": actual_iters,
-                        "max_k": base_iterations,
+                        "max_k": epoch_k_limit,
                         "layer": step % layers_count,
                         "residual": residual_value,
-                        "solver": solver,
+                        "solver": "anderson",
+                        "k_bin": epoch_bin,
                         "time_unix": _current_millis(),
                     }
 
@@ -1154,7 +1342,7 @@ class TrainingService:
                         step_duration * 1000.0,
                         ema_loss_str,
                         ema_acc_str,
-                        lr,
+                        current_lr,
                         batch_x.shape[0],
                     )
 
@@ -1162,7 +1350,7 @@ class TrainingService:
                         await asyncio.sleep(0)
 
                 val_loss, val_acc, val_top5 = self._evaluate(
-                    model, dataset.val_x, dataset.val_y, kernel, batch_size=512
+                    model, dataset.val_x, dataset.val_y, kernel, temperature, batch_size=512
                 )
                 best_acc = max(best_acc, val_acc)
                 best_loss = min(best_loss, val_loss)
@@ -1186,6 +1374,8 @@ class TrainingService:
                     "time_unix": _current_millis(),
                     "train_loss": train_loss_epoch,
                     "train_acc": train_acc_epoch,
+                    "temperature": temperature,
+                    "logit_scale": model.logit_scale,
                 }
                 if residual_mean is not None:
                     epoch_payload["residual"] = residual_mean
@@ -1214,6 +1404,8 @@ class TrainingService:
                     "train_acc": train_acc_epoch,
                     "val_loss": val_loss,
                     "val_acc": val_acc,
+                    "temperature": temperature,
+                    "logit_scale": model.logit_scale,
                 }
                 if avg_throughput is not None:
                     log_metric["avg_throughput"] = avg_throughput
@@ -1289,6 +1481,9 @@ class TrainingService:
         dataset_dir = self._data_root / "mnist"
         npz_path = dataset_dir / "mnist.npz"
         if not npz_path.exists():
+            logger.warning("未找到 MNIST 数据文件，自动生成占位数据集：%s", npz_path)
+            self._generate_placeholder_mnist(npz_path)
+        if not npz_path.exists():
             raise FileNotFoundError(f"未找到 MNIST 数据文件：{npz_path}")
         with np.load(npz_path) as data:
             train_x = data["x_train"].astype(np.float32) / 255.0
@@ -1299,6 +1494,36 @@ class TrainingService:
         test_x = test_x.reshape(test_x.shape[0], -1)
         num_classes = int(np.max(np.concatenate([train_y, test_y])) + 1)
         return DatasetBundle(train_x, train_y, test_x, test_y, train_x.shape[1], num_classes)
+
+    def _generate_placeholder_mnist(self, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        rng = np.random.default_rng(self._np_seed)
+        train_samples = 512
+        test_samples = 128
+        feature_dim = 28 * 28
+        x_train = rng.random((train_samples, feature_dim), dtype=np.float32)
+        y_train = rng.integers(0, 10, size=train_samples, endpoint=False).astype(np.int64)
+        x_test = rng.random((test_samples, feature_dim), dtype=np.float32)
+        y_test = rng.integers(0, 10, size=test_samples, endpoint=False).astype(np.int64)
+        np.savez(target, x_train=x_train, y_train=y_train, x_test=x_test, y_test=y_test)
+        metadata = {
+            "name": "MNIST",
+            "generated": True,
+            "files": [
+                {
+                    "filename": target.name,
+                    "size_bytes": target.stat().st_size,
+                    "source": "generated://placeholder",
+                }
+            ],
+        }
+        metadata_path = target.parent / "metadata.json"
+        sample_path = target.parent / "sample.txt"
+        try:
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            sample_path.write_text("Dataset placeholder generated locally.\n", encoding="utf-8")
+        except OSError:
+            logger.warning("无法写入 MNIST 占位符元数据：%s", metadata_path)
 
     def _load_fashion_mnist(self) -> DatasetBundle:
         dataset_dir = self._data_root / "fashion"
@@ -1334,12 +1559,13 @@ class TrainingService:
         timesteps: int,
         num_classes: int,
         rng: np.random.Generator,
+        logit_scale: float,
     ) -> ModelState:
         scale = math.sqrt(2.0 / max(1, input_dim))
         W_basal = rng.normal(0.0, scale, size=(num_classes, timesteps, input_dim)).astype(np.float32)
         b_basal = np.zeros((num_classes, timesteps), dtype=np.float32)
         b_out = np.zeros(num_classes, dtype=np.float32)
-        return ModelState(W_basal=W_basal, b_basal=b_basal, b_out=b_out)
+        return ModelState(W_basal=W_basal, b_basal=b_basal, b_out=b_out, logit_scale=float(logit_scale))
 
     def _forward_batch(
         self,
@@ -1390,12 +1616,64 @@ class TrainingService:
         grads: Dict[str, np.ndarray],
         lr: float,
         weight_decay: float,
+        *,
+        learnable_logit_scale: bool = False,
+        logit_scale_grad: Optional[float] = None,
     ) -> None:
         if weight_decay > 0:
             model.W_basal *= (1.0 - lr * weight_decay)
         model.W_basal -= lr * grads["W_basal"]
         model.b_basal -= lr * grads["b_basal"]
         model.b_out -= lr * grads["b_out"]
+        if learnable_logit_scale and logit_scale_grad is not None:
+            updated = model.logit_scale - lr * logit_scale_grad
+            model.logit_scale = float(np.clip(updated, 0.5, 3.0))
+
+    @staticmethod
+    def _normalize_k_schedule(raw: Any, fallback: int) -> Optional[List[int]]:
+        values: List[int] = []
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                try:
+                    value = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    values.append(value)
+        elif isinstance(raw, str):
+            parts = [part.strip() for part in raw.split(",") if part.strip()]
+            for part in parts:
+                try:
+                    value = int(part)
+                except ValueError:
+                    continue
+                if value > 0:
+                    values.append(value)
+        elif isinstance(raw, dict):
+            ordered = sorted(raw.items(), key=lambda entry: str(entry[0]))
+            for _, entry_value in ordered:
+                try:
+                    value = int(entry_value)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    values.append(value)
+        if not values:
+            return None
+        return values
+
+    @staticmethod
+    def _k_limit_for_epoch(
+        epoch_index: int,
+        epochs: int,
+        schedule: Optional[List[int]],
+        default_value: int,
+    ) -> Tuple[int, int]:
+        if not schedule:
+            return 0, default_value
+        bin_size = max(1, math.ceil(epochs / len(schedule)))
+        bin_index = min(len(schedule) - 1, max(0, (epoch_index - 1) // bin_size))
+        return bin_index, schedule[bin_index]
 
     def _build_iteration_events(
         self,
@@ -1450,6 +1728,7 @@ class TrainingService:
         inputs: np.ndarray,
         labels: np.ndarray,
         kernel: np.ndarray,
+        temperature: float,
         batch_size: int = 512,
     ) -> Tuple[float, float, float]:
         total = inputs.shape[0]
@@ -1460,7 +1739,8 @@ class TrainingService:
             end = start + batch_size
             batch_x = inputs[start:end]
             batch_y = labels[start:end]
-            logits, _ = self._forward_batch(model, batch_x, kernel)
+            logits_raw, _ = self._forward_batch(model, batch_x, kernel)
+            logits = logits_raw * (model.logit_scale / temperature)
             loss, probs, _ = self._cross_entropy(logits, batch_y)
             pred = np.argmax(probs, axis=1)
             losses.append(loss)
@@ -1485,9 +1765,9 @@ def create_app(message_queue_config: Optional[Dict[str, Any]] = None) -> FastAPI
     mq_config = message_queue_config or get_message_queue_config()
     broker, queue = _build_broker(mq_config)
     dataset_service = DatasetService(broker)
-    training_service = TrainingService(broker)
-    log_buffer = LogRingBuffer(capacity=200)
     global_config = load_config()
+    training_service = TrainingService(broker, defaults=global_config.get("training_service"))
+    log_buffer = LogRingBuffer(capacity=200)
     worker_nats_cfg = {}
     training_worker_cfg = global_config.get("training_worker") if isinstance(global_config, dict) else {}
     if isinstance(training_worker_cfg, dict):
@@ -1525,7 +1805,12 @@ def create_app(message_queue_config: Optional[Dict[str, Any]] = None) -> FastAPI
 
     @app.get("/api/config")
     async def get_config() -> Dict[str, Any]:
-        return {"training": training_service.get_config(), "status": training_service.status}
+        return {
+            "training": training_service.get_config(),
+            "training_worker": copy.deepcopy(global_config.get("training_worker")),
+            "training_service": copy.deepcopy(global_config.get("training_service")),
+            "status": training_service.status,
+        }
 
     @app.get("/api/datasets")
     async def list_datasets() -> Dict[str, Any]:

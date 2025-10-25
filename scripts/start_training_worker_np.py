@@ -74,6 +74,12 @@ class HyperParams:
     rate_target: float = 0.0
     g_apical_start: float = 0.5
     g_apical_end: float = 0.2
+    beta_start: Optional[float] = None
+    beta_end: Optional[float] = None
+    v_th_start: Optional[float] = None
+    v_th_end: Optional[float] = None
+    contraction_rho: float = 0.9
+    contraction_lambda: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -138,6 +144,24 @@ def load_yaml_config(path: Path) -> Dict[str, Any]:
     return data
 
 
+def _parse_schedule(raw: Any) -> Tuple[Optional[float], Optional[float]]:
+    """Extract optional (start, end) floats from a config value."""
+
+    if raw is None:
+        return None, None
+    start_value: Optional[float]
+    end_value: Optional[float]
+    if isinstance(raw, dict):
+        raw_start = raw.get("start")
+        raw_end = raw.get("end", raw_start)
+        start_value = float(raw_start) if raw_start is not None else None
+        end_value = float(raw_end) if raw_end is not None else start_value
+    else:
+        start_value = float(raw)
+        end_value = float(raw)
+    return start_value, end_value
+
+
 def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> WorkerConfig:
     worker_raw = raw.get("training_worker", {})
     if not isinstance(worker_raw, dict):
@@ -183,6 +207,10 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         grad_clip_value = None
     rate_lambda = float(hyper_raw.get("rate_reg_lambda", 0.0))
     rate_target = float(hyper_raw.get("rate_target", 0.0))
+    reg_block = hyper_raw.get("tstep_regularization")
+    if isinstance(reg_block, dict):
+        rate_lambda = float(reg_block.get("rate_reg_lambda", reg_block.get("lambda", rate_lambda)))
+        rate_target = float(reg_block.get("rate_target", reg_block.get("target", rate_target)))
     g_apical_raw = hyper_raw.get("g_apical", {"start": 0.5, "end": 0.2})
     if isinstance(g_apical_raw, dict):
         g_apical_start = float(g_apical_raw.get("start", 0.5))
@@ -190,6 +218,28 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
     else:
         g_apical_start = float(g_apical_raw)
         g_apical_end = float(hyper_raw.get("g_apical_end", g_apical_start))
+    solver_block = hyper_raw.get("solver")
+    solver_value = str(hyper_raw.get("solver", "plain")).lower() if not isinstance(solver_block, dict) else "plain"
+    anderson_m_value = int(hyper_raw.get("anderson_m", 4))
+    anderson_beta_value = float(hyper_raw.get("anderson_beta", 0.5))
+    k_schedule_value = hyper_raw.get("K_schedule")
+    if isinstance(solver_block, dict):
+        solver_value = str(solver_block.get("type") or solver_block.get("name") or solver_value).lower()
+        anderson_m_value = int(solver_block.get("anderson_m", anderson_m_value))
+        anderson_beta_value = float(solver_block.get("anderson_beta", anderson_beta_value))
+        k_schedule_value = solver_block.get("K_schedule", solver_block.get("schedule", k_schedule_value))
+    warmup_steps_value = hyper_raw.get("warmup_steps")
+    scheduler_block = hyper_raw.get("scheduler")
+    if warmup_steps_value is None and isinstance(scheduler_block, dict):
+        warmup_steps_value = scheduler_block.get("warmup_steps")
+    warmup_steps_value = max(0, int(warmup_steps_value or 0))
+    beta_start, beta_end = _parse_schedule(hyper_raw.get("beta"))
+    v_th_start, v_th_end = _parse_schedule(hyper_raw.get("v_th"))
+    contraction_rho = float(hyper_raw.get("contraction_rho", 0.9))
+    contraction_lambda = float(hyper_raw.get("contraction_lambda", 0.0))
+    if contraction_rho <= 0.0:
+        contraction_rho = 0.0
+    contraction_lambda = max(0.0, contraction_lambda)
 
     hyper = HyperParams(
         epochs=int(hyper_raw.get("epochs", 1)),
@@ -199,18 +249,24 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         truncation_steps=int(hyper_raw.get("truncation_steps", 4)),
         timesteps=int(hyper_raw.get("timesteps", 16)),
         seed=int(hyper_raw.get("seed", 42)),
-        warmup_steps=max(0, int(hyper_raw.get("warmup_steps", 0))),
+        warmup_steps=warmup_steps_value,
         grad_clip=grad_clip_value,
         temperature=max(1e-6, temperature_value),
         learnable_temperature=temperature_learnable,
-        solver=str(hyper_raw.get("solver", "plain")).lower(),
-        anderson_m=int(hyper_raw.get("anderson_m", 4)),
-        anderson_beta=float(hyper_raw.get("anderson_beta", 0.5)),
-        K_schedule=hyper_raw.get("K_schedule"),
+        solver=solver_value,
+        anderson_m=anderson_m_value,
+        anderson_beta=anderson_beta_value,
+        K_schedule=k_schedule_value,
         rate_reg_lambda=max(0.0, rate_lambda),
         rate_target=rate_target,
         g_apical_start=g_apical_start,
         g_apical_end=g_apical_end,
+        beta_start=beta_start,
+        beta_end=beta_end,
+        v_th_start=v_th_start,
+        v_th_end=v_th_end,
+        contraction_rho=contraction_rho,
+        contraction_lambda=contraction_lambda,
     )
 
     neuron_raw = worker_raw.get("neuron", {})
@@ -323,42 +379,63 @@ def softmax(logits: np.ndarray) -> np.ndarray:
 
 
 def nll_from_logits(logits: np.ndarray, targets: np.ndarray) -> Tuple[float, np.ndarray]:
+    if logits.ndim != 2:
+        raise ValueError("logits must be a 2D array")
     if targets.dtype != np.int64:
         raise TypeError("labels must be np.int64 for indexing")
-    log_probs = log_softmax(logits)
+    batch_size = logits.shape[0]
+    if targets.shape and targets.shape[0] not in {0, batch_size}:
+        raise ValueError("targets must match logits batch dimension")
+    logits64 = logits.astype(np.float64, copy=False)
+    max_logits = np.max(logits64, axis=1, keepdims=True)
+    shifted = logits64 - max_logits
+    exp_shifted = np.exp(shifted, dtype=np.float64)
+    denom = np.clip(np.sum(exp_shifted, axis=1, keepdims=True), 1e-12, None)
+    probs64 = exp_shifted / denom
+    probs = probs64.astype(logits.dtype, copy=False)
     if targets.size == 0:
-        return 0.0, log_probs
-    idx = (np.arange(targets.shape[0]), targets)
-    nll = -log_probs[idx]
-    loss = float(np.mean(nll)) if nll.size else 0.0
-    return loss, log_probs
+        return 0.0, probs
+    logsum = np.log(denom)
+    row_idx = np.arange(targets.shape[0])
+    target_shifted = shifted[row_idx, targets]
+    log_prob_targets = target_shifted - logsum[:, 0]
+    nll_values = -log_prob_targets
+    loss = float(np.mean(nll_values)) if nll_values.size else 0.0
+    return loss, probs
 
 
-def probabilities_and_stats(log_probs: np.ndarray, targets: np.ndarray) -> Tuple[np.ndarray, float, float, float, float]:
-    probs = np.exp(log_probs.astype(np.float64, copy=False))
+def classification_stats(probs: np.ndarray, targets: np.ndarray) -> Tuple[float, float, float, float]:
+    if probs.ndim != 2:
+        raise ValueError("probabilities must be a 2D array")
     batch = probs.shape[0]
     if batch == 0:
-        return probs, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
-    entropy_values = -np.sum(probs * log_probs.astype(np.float64, copy=False), axis=1)
+    probs64 = probs.astype(np.float64, copy=False)
+    probs_safe = np.clip(probs64, 1e-12, 1.0)
+    entropy_values = -np.sum(probs_safe * np.log(probs_safe), axis=1)
     entropy = float(np.mean(entropy_values)) if entropy_values.size else 0.0
 
     if targets.size == 0:
-        return probs, 0.0, 0.0, 0.0, entropy
+        return 0.0, 0.0, 0.0, entropy
+    if targets.shape[0] != batch:
+        raise ValueError("targets length must match probabilities batch size")
 
     preds = np.argmax(probs, axis=1)
     top1 = float(np.mean(preds == targets))
 
-    topk = min(5, probs.shape[1])
-    if topk > 0:
-        topk_indices = np.argsort(-probs, axis=1)[:, :topk]
-        hits = np.any(topk_indices == targets[:, None], axis=1)
+    classes = probs.shape[1]
+    k = min(5, classes)
+    if k > 0:
+        kth_index = max(classes - k, 0)
+        partition = np.argpartition(probs, kth_index, axis=1)[:, -k:]
+        hits = np.any(partition == targets[:, None], axis=1)
         top5 = float(np.mean(hits))
     else:
         top5 = 0.0
 
-    confidence = float(np.mean(probs[np.arange(targets.shape[0]), targets]))
-    return probs, top1, top5, confidence, entropy
+    confidence = float(np.mean(probs[np.arange(batch), targets]))
+    return top1, top5, confidence, entropy
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +569,8 @@ class ThreeCompartmentModel:
         self,
         inputs: np.ndarray,
         apical_coupling_override: Optional[float] = None,
+        beta_override: Optional[float] = None,
+        threshold_override: Optional[float] = None,
     ) -> Tuple[np.ndarray, List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
         """Execute forward pass across full sequence.
 
@@ -508,13 +587,14 @@ class ThreeCompartmentModel:
         neuron = self.neuron
 
         alpha = neuron.alpha
-        beta = neuron.beta
+        beta = float(np.clip(beta_override, 0.0, 1.0)) if beta_override is not None else neuron.beta
         gamma = neuron.gamma
         coupling_apical = (
             float(apical_coupling_override)
             if apical_coupling_override is not None
             else neuron.coupling_apical
         )
+        threshold_value = float(threshold_override) if threshold_override is not None else neuron.threshold
 
         h = np.full((batch, hidden), neuron.v_rest, dtype=np.float64)
         basal = np.full_like(h, neuron.v_rest)
@@ -535,7 +615,7 @@ class ThreeCompartmentModel:
                 coupling_apical * apical + neuron.coupling_basal * basal + z_t
             )
 
-            spike_mask = h >= neuron.threshold
+            spike_mask = h >= threshold_value
             spikes.append(spike_mask.copy())
 
             h_list.append(h.copy())
@@ -562,6 +642,7 @@ def _aggregate_spikes(spikes: Iterable[np.ndarray]) -> Tuple[int, List[int]]:
 @dataclass
 class TrainStepResult:
     loss: float
+    nll: float
     acc: float
     top5: float
     confidence: float
@@ -589,6 +670,16 @@ class Trainer:
         self.rate_target = float(self.cfg.hyper.rate_target)
         self.g_apical_start = float(self.cfg.hyper.g_apical_start)
         self.g_apical_end = float(self.cfg.hyper.g_apical_end)
+        self.beta_start = self.cfg.hyper.beta_start
+        self.beta_end = self.cfg.hyper.beta_end
+        self.v_th_start = self.cfg.hyper.v_th_start
+        self.v_th_end = self.cfg.hyper.v_th_end
+        self.contraction_rho = float(self.cfg.hyper.contraction_rho)
+        self.contraction_lambda = max(0.0, float(self.cfg.hyper.contraction_lambda))
+        self._base_beta = self.model.neuron.beta
+        self._base_threshold = self.model.neuron.threshold
+        self._spectral_rng = np.random.default_rng(self.cfg.hyper.seed)
+        self._spectral_vec: Optional[np.ndarray] = None
 
     @property
     def temperature(self) -> float:
@@ -599,6 +690,8 @@ class Trainer:
         batch_x: np.ndarray,
         *,
         apical_coupling_override: Optional[float] = None,
+        beta_override: Optional[float] = None,
+        threshold_override: Optional[float] = None,
     ) -> Tuple[
         np.ndarray,
         List[np.ndarray],
@@ -606,7 +699,31 @@ class Trainer:
         List[np.ndarray],
         List[np.ndarray],
     ]:
-        return self.model.forward(batch_x, apical_coupling_override)
+        return self.model.forward(
+            batch_x,
+            apical_coupling_override,
+            beta_override,
+            threshold_override,
+        )
+
+    @staticmethod
+    def _interp(start: float, end: float, progress: float) -> float:
+        progress_clamped = float(np.clip(progress, 0.0, 1.0))
+        return start + (end - start) * progress_clamped
+
+    def resolve_annealed_params(self, progress: float) -> Tuple[float, Optional[float], Optional[float]]:
+        g_apical = float(self._interp(self.g_apical_start, self.g_apical_end, progress))
+        beta_override: Optional[float] = None
+        if self.beta_start is not None or self.beta_end is not None:
+            start = self.beta_start if self.beta_start is not None else self._base_beta
+            end = self.beta_end if self.beta_end is not None else self._base_beta
+            beta_override = float(np.clip(self._interp(start, end, progress), 0.0, 1.0))
+        threshold_override: Optional[float] = None
+        if self.v_th_start is not None or self.v_th_end is not None:
+            start = self.v_th_start if self.v_th_start is not None else self._base_threshold
+            end = self.v_th_end if self.v_th_end is not None else self._base_threshold
+            threshold_override = float(self._interp(start, end, progress))
+        return g_apical, beta_override, threshold_override
 
     @staticmethod
     def _mean_soma_states(h_list: List[np.ndarray]) -> np.ndarray:
@@ -615,12 +732,51 @@ class Trainer:
         soma_stack = np.stack(h_list[1:], axis=0)
         return np.mean(soma_stack, axis=0)
 
+    def _estimate_spectral_norm(self, matrix: np.ndarray, iterations: int = 6) -> float:
+        if matrix.size == 0:
+            return 0.0
+        dim = matrix.shape[1]
+        vec = self._spectral_vec
+        if vec is None or vec.shape[0] != dim:
+            vec = self._spectral_rng.standard_normal(dim)
+        v = vec.astype(np.float64, copy=True)
+        for _ in range(max(1, iterations)):
+            mv = matrix @ v
+            norm_mv = np.linalg.norm(mv)
+            if norm_mv == 0.0 or not np.isfinite(norm_mv):
+                v = self._spectral_rng.standard_normal(dim)
+                continue
+            v = (matrix.T @ (mv / norm_mv))
+            norm_v = np.linalg.norm(v)
+            if norm_v == 0.0 or not np.isfinite(norm_v):
+                v = self._spectral_rng.standard_normal(dim)
+            else:
+                v /= norm_v
+        self._spectral_vec = v
+        mv_final = matrix @ v
+        return float(np.linalg.norm(mv_final))
+
+    def enforce_contraction(self) -> None:
+        if self.cfg.mode != "fpt":
+            return
+        rho = max(0.0, self.contraction_rho)
+        if rho <= 0.0:
+            return
+        spectral = self._estimate_spectral_norm(self.model.Whh)
+        if spectral <= 0.0 or spectral <= rho:
+            return
+        scale = rho / spectral
+        self.model.Whh *= scale
+        LOGGER.info("Rescaled Whh spectral norm from %.4f to %.4f via contraction", spectral, rho)
+
     def _train_step_tstep(
         self,
         batch_x: np.ndarray,
         batch_y: np.ndarray,
         lr: float,
         apical_coupling: Optional[float] = None,
+        beta_override: Optional[float] = None,
+        threshold_override: Optional[float] = None,
     ) -> TrainStepResult:
         num_classes = self.model.network.output_dim
         if batch_y.dtype != np.int64:
@@ -631,7 +787,12 @@ class Trainer:
             if y_min < 0 or y_max >= num_classes:
                 raise ValueError(f"labels out of range [{y_min}, {y_max}) for {num_classes} classes")
 
-        _, h_list, _, _, spikes = self._forward_batch(batch_x, apical_coupling_override=apical_coupling)
+        _, h_list, _, _, spikes = self._forward_batch(
+            batch_x,
+            apical_coupling_override=apical_coupling,
+            beta_override=beta_override,
+            threshold_override=threshold_override,
+        )
         features = self._mean_soma_states(h_list)
         pre_logits = features @ self.model.Wo.T + self.model.bo
         temp_value = self.temperature
@@ -639,20 +800,21 @@ class Trainer:
         if logits.ndim != 2 or logits.shape[1] != num_classes:
             raise ValueError(f"logits must be (batch,{num_classes}), got {logits.shape}")
 
-        loss, log_probs = nll_from_logits(logits, batch_y)
-        probs, acc, top5, confidence, entropy = probabilities_and_stats(log_probs, batch_y)
+        nll, probs = nll_from_logits(logits, batch_y)
+        acc, top5, confidence, entropy = classification_stats(probs, batch_y)
         row_sums = np.sum(probs, axis=1)
         if not np.all(np.isfinite(row_sums)) or np.max(np.abs(row_sums - 1.0)) > 1e-4:
             raise ValueError("probabilities must sum to 1 per row")
-        preds = np.argmax(probs, axis=1)
-        if preds.shape != batch_y.shape:
-            raise ValueError("predictions shape mismatch")
+        loss = nll
+        contraction_lambda = self.contraction_lambda if self.cfg.mode == "fpt" else 0.0
+        if contraction_lambda > 0.0:
+            loss += contraction_lambda * float(np.sum(self.model.Whh ** 2))
         s_rate = float(np.mean(features)) if features.size else 0.0
         if self.rate_reg_lambda > 0.0:
             rate_error = s_rate - self.rate_target
             loss += self.rate_reg_lambda * (rate_error ** 2)
 
-        grad_logits = probs
+        grad_logits = probs.copy()
         if batch_y.size:
             grad_logits[np.arange(batch_y.shape[0]), batch_y] -= 1.0
         grad_logits /= max(batch_y.shape[0], 1)
@@ -682,6 +844,7 @@ class Trainer:
         total_spikes, per_neuron = _aggregate_spikes(spikes)
         return TrainStepResult(
             loss=loss,
+            nll=nll,
             acc=acc,
             top5=top5,
             confidence=confidence,
@@ -691,26 +854,50 @@ class Trainer:
             s_rate=s_rate,
         )
 
-    def _train_step_fpt(self, batch_x: np.ndarray, batch_y: np.ndarray, lr: float) -> TrainStepResult:
+    def _train_step_fpt(
+        self,
+        batch_x: np.ndarray,
+        batch_y: np.ndarray,
+        lr: float,
+        apical_coupling: Optional[float] = None,
+        beta_override: Optional[float] = None,
+        threshold_override: Optional[float] = None,
+    ) -> TrainStepResult:
         num_classes = self.model.network.output_dim
         assert batch_y.dtype == np.int64, "labels must be int64"
         if batch_y.size > 0:
             assert int(batch_y.min()) >= 0 and int(batch_y.max()) < num_classes, "labels out of range"
 
-        pre_logits, h_list, _, _, spikes = self._forward_batch(batch_x)
+        pre_logits, h_list, _, _, spikes = self._forward_batch(
+            batch_x,
+            apical_coupling_override=apical_coupling,
+            beta_override=beta_override,
+            threshold_override=threshold_override,
+        )
+        s_mean = self._mean_soma_states(h_list)
+        s_rate = float(np.mean(s_mean)) if s_mean.size else 0.0
         temp_value = self.temperature
         logits = pre_logits / temp_value
         assert logits.shape[1] == num_classes, "logit dimension mismatch"
 
-        loss, log_probs = nll_from_logits(logits, batch_y)
-        probs, acc, top5, confidence, entropy = probabilities_and_stats(log_probs, batch_y)
+        nll, probs = nll_from_logits(logits, batch_y)
+        acc, top5, confidence, entropy = classification_stats(probs, batch_y)
+        loss = nll
+        if self.rate_reg_lambda > 0.0:
+            rate_error = s_rate - self.rate_target
+            loss += self.rate_reg_lambda * (rate_error ** 2)
 
-        grad_logits = probs
+        grad_logits = probs.copy()
         if batch_y.size:
             grad_logits[np.arange(batch_y.shape[0]), batch_y] -= 1.0
         grad_logits /= max(batch_y.shape[0], 1)
 
         neuron = self.cfg.neuron
+        beta_value = (
+            float(np.clip(beta_override, 0.0, 1.0))
+            if beta_override is not None
+            else neuron.beta
+        )
         max_steps = max(1, self.cfg.hyper.truncation_steps)
         solver = self.solver
         anderson_depth = max(1, self.anderson_m)
@@ -739,7 +926,7 @@ class Trainer:
                 grad_Whh = np.zeros_like(self.model.Whh)
                 grad_bh = np.zeros_like(self.model.bh)
                 alpha = neuron.alpha
-                beta = neuron.beta
+                beta = beta_value
                 gamma = neuron.gamma
                 timesteps = batch_x.shape[1]
                 for idx in range(timesteps - 1, -1, -1):
@@ -789,7 +976,7 @@ class Trainer:
         grad_bh = np.zeros_like(self.model.bh)
 
         alpha = neuron.alpha
-        beta = neuron.beta
+        beta = beta_value
         gamma = neuron.gamma
 
         timesteps = batch_x.shape[1]
@@ -824,6 +1011,8 @@ class Trainer:
                 break
 
         residual_value = residual_accum / residual_count if residual_count > 0 else 0.0
+        if contraction_lambda > 0.0:
+            grad_Whh += 2.0 * contraction_lambda * self.model.Whh
 
         temp_grad_arr = None
         if self.learnable_temperature:
@@ -852,6 +1041,7 @@ class Trainer:
         total_spikes, per_neuron = _aggregate_spikes(spikes)
         return TrainStepResult(
             loss=loss,
+            nll=nll,
             acc=acc,
             top5=top5,
             confidence=confidence,
@@ -859,10 +1049,18 @@ class Trainer:
             spikes_total=total_spikes,
             spikes_per_neuron=per_neuron,
             residual=residual_value,
+            s_rate=s_rate,
         )
 
     def evaluate(
-        self, data_x: np.ndarray, data_y: np.ndarray, batch_size: int
+        self,
+        data_x: np.ndarray,
+        data_y: np.ndarray,
+        batch_size: int,
+        *,
+        apical_coupling: Optional[float] = None,
+        beta_override: Optional[float] = None,
+        threshold_override: Optional[float] = None,
     ) -> Tuple[float, float, float, float, float]:
         total_loss = 0.0
         total_acc = 0.0
@@ -875,13 +1073,18 @@ class Trainer:
             end = start + batch_size
             batch_x = data_x[start:end]
             batch_y = data_y[start:end]
-            logits, h_list, _, _, _ = self._forward_batch(batch_x)
+            logits, h_list, _, _, _ = self._forward_batch(
+                batch_x,
+                apical_coupling_override=apical_coupling,
+                beta_override=beta_override,
+                threshold_override=threshold_override,
+            )
             if self.cfg.mode == "tstep":
                 features = self._mean_soma_states(h_list)
                 logits = features @ self.model.Wo.T + self.model.bo
             logits = logits / temp_value
-            loss, log_probs = nll_from_logits(logits, batch_y)
-            _, acc, top5, confidence, entropy = probabilities_and_stats(log_probs, batch_y)
+            loss, probs = nll_from_logits(logits, batch_y)
+            acc, top5, confidence, entropy = classification_stats(probs, batch_y)
             batch_count = batch_x.shape[0]
             total_loss += loss * batch_count
             total_acc += acc * batch_count
@@ -905,10 +1108,26 @@ class Trainer:
         lr: float,
         *,
         apical_coupling: Optional[float] = None,
+        beta_override: Optional[float] = None,
+        threshold_override: Optional[float] = None,
     ) -> TrainStepResult:
         if self.cfg.mode == "tstep":
-            return self._train_step_tstep(batch_x, batch_y, lr, apical_coupling)
-        return self._train_step_fpt(batch_x, batch_y, lr)
+            return self._train_step_tstep(
+                batch_x,
+                batch_y,
+                lr,
+                apical_coupling,
+                beta_override,
+                threshold_override,
+            )
+        return self._train_step_fpt(
+            batch_x,
+            batch_y,
+            lr,
+            apical_coupling,
+            beta_override,
+            threshold_override,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +1163,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
         last_lr = worker_cfg.hyper.lr
         for epoch in range(epochs):
             epoch_loss = 0.0
+            epoch_nll = 0.0
             epoch_acc = 0.0
             epoch_top5 = 0.0
             epoch_conf = 0.0
@@ -951,17 +1171,11 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
             epoch_examples = 0
             epoch_throughputs: List[float] = []
             epoch_residuals: List[float] = []
-            if worker_cfg.mode == "tstep":
-                if epochs <= 1:
-                    g_apical_value = trainer.g_apical_end
-                else:
-                    progress = (epoch - 1) / max(1, epochs - 1)
-                    g_apical_value = trainer.g_apical_start + (
-                        trainer.g_apical_end - trainer.g_apical_start
-                    ) * progress
-                g_apical_value = float(g_apical_value)
+            if epochs <= 1:
+                progress = 1.0
             else:
-                g_apical_value = None
+                progress = epoch / max(1, epochs - 1)
+            g_apical_value, beta_override, threshold_override = trainer.resolve_annealed_params(progress)
             for batch_x, batch_y in _batch_iterator(train_x, train_y, worker_cfg.hyper.batch_size):
                 step_start = time.perf_counter()
                 global_step += 1
@@ -978,6 +1192,8 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                         batch_y,
                         current_lr,
                         apical_coupling=g_apical_value,
+                        beta_override=beta_override,
+                        threshold_override=threshold_override,
                     )
                 except AssertionError as exc:
                     await publisher.publish_json(
@@ -992,6 +1208,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 step_duration = max(time.perf_counter() - step_start, 1e-6)
                 batch_size = batch_x.shape[0]
                 epoch_loss += result.loss * batch_size
+                epoch_nll += result.nll * batch_size
                 epoch_acc += result.acc * batch_size
                 epoch_top5 += result.top5 * batch_size
                 epoch_conf += result.confidence * batch_size
@@ -1008,7 +1225,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                         "epoch": epoch + 1,
                         "step": global_step,
                         "loss": result.loss,
-                        "nll": result.loss,
+                        "nll": result.nll,
                         "acc": result.acc,
                         "top5": result.top5,
                         "conf": result.confidence,
@@ -1023,8 +1240,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                     }
                     if result.residual is not None:
                         metrics_payload["residual"] = result.residual
-                    if result.s_rate is not None:
-                        metrics_payload["s_rate"] = result.s_rate
+                    metrics_payload["s_rate"] = float(result.s_rate) if result.s_rate is not None else 0.0
                     spikes_payload = {
                         "epoch": epoch + 1,
                         "step": global_step,
@@ -1040,13 +1256,21 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
 
             denom = max(epoch_examples, 1)
             train_avg_loss = epoch_loss / denom
+            train_avg_nll = epoch_nll / denom
             train_avg_acc = epoch_acc / denom
             train_avg_top5 = epoch_top5 / denom
             train_avg_conf = epoch_conf / denom
             train_avg_entropy = epoch_entropy / denom
             val_loss, val_acc, val_top5, val_conf, val_entropy = trainer.evaluate(
-                val_x, val_y, worker_cfg.hyper.batch_size
+                val_x,
+                val_y,
+                worker_cfg.hyper.batch_size,
+                apical_coupling=g_apical_value,
+                beta_override=beta_override,
+                threshold_override=threshold_override,
             )
+            if worker_cfg.mode == "fpt":
+                trainer.enforce_contraction()
             avg_throughput = float(np.mean(epoch_throughputs)) if epoch_throughputs else None
             residual_mean = float(np.mean(epoch_residuals)) if epoch_residuals else None
 
@@ -1062,7 +1286,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 "lr": last_lr,
                 "temperature": trainer.temperature,
                 "train_loss": train_avg_loss,
-                "train_nll": train_avg_loss,
+                "train_nll": train_avg_nll,
                 "train_acc": train_avg_acc,
                 "train_top5": train_avg_top5,
                 "train_conf": train_avg_conf,
@@ -1077,6 +1301,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
 
             log_metric = {
                 "train_loss": train_avg_loss,
+                "train_nll": train_avg_nll,
                 "train_acc": train_avg_acc,
                 "train_top5": train_avg_top5,
                 "train_conf": train_avg_conf,
