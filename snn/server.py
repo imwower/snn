@@ -1380,6 +1380,7 @@ class TrainingService:
                 epoch_indices = np_rng.permutation(total_examples)
                 batch_throughputs: List[float] = []
                 epoch_loss_total = 0.0
+                epoch_nll_total = 0.0
                 epoch_acc_total = 0.0
                 epoch_examples = 0
                 epoch_residuals: List[float] = []
@@ -1467,7 +1468,7 @@ class TrainingService:
                     head_outputs, head_cache = model.head.forward(head_inputs, return_cache=True)
                     scale_factor = model.logit_scale / temperature
                     logits = head_outputs * scale_factor
-                    nll, probs = self._nll_from_logits(logits, batch_y)
+                    nll, probs = self._nll_from_logits(logits, batch_y, num_classes=num_classes)
                     loss = nll
                     if is_tstep_mode and rate_reg_lambda > 0.0:
                         rate_error = batch_s_rate - rate_target
@@ -1507,6 +1508,7 @@ class TrainingService:
     
                     if batch_size_actual > 0:
                         epoch_loss_total += loss * batch_size_actual
+                        epoch_nll_total += nll * batch_size_actual
                         epoch_acc_total += batch_acc * batch_size_actual
                         epoch_examples += batch_size_actual
                         epoch_conf_total += confidence * batch_size_actual
@@ -1585,7 +1587,7 @@ class TrainingService:
                         "epoch": epoch,
                         "step": step + 1,
                         "loss": loss,
-                        "nll": loss,
+                        "nll": nll,
                         "acc": batch_acc,
                         "top5": top5_acc,
                         "conf": confidence,
@@ -1675,6 +1677,7 @@ class TrainingService:
                 avg_throughput = float(np.mean(batch_throughputs)) if batch_throughputs else None
                 denom = max(epoch_examples, 1)
                 train_loss_epoch = epoch_loss_total / denom
+                train_nll_epoch = epoch_nll_total / denom
                 train_acc_epoch = epoch_acc_total / denom
                 train_conf_epoch = epoch_conf_total / denom
                 train_entropy_epoch = epoch_entropy_total / denom
@@ -1705,6 +1708,7 @@ class TrainingService:
                     "top5": val_top5,
                     "time_unix": _current_millis(),
                     "train_loss": train_loss_epoch,
+                    "train_nll": train_nll_epoch,
                     "train_acc": train_acc_epoch,
                     "train_conf": train_conf_epoch,
                     "train_entropy": train_entropy_epoch,
@@ -1742,6 +1746,7 @@ class TrainingService:
     
                 log_metric: Dict[str, Any] = {
                     "train_loss": train_loss_epoch,
+                    "train_nll": train_nll_epoch,
                     "train_acc": train_acc_epoch,
                     "train_conf": train_conf_epoch,
                     "train_entropy": train_entropy_epoch,
@@ -1749,6 +1754,7 @@ class TrainingService:
                     "train_logit_mean": train_logit_mean,
                     "train_logit_std": train_logit_std,
                     "val_loss": val_loss,
+                    "val_nll": val_loss,
                     "val_acc": val_acc,
                     "val_conf": val_conf,
                     "val_entropy": val_entropy,
@@ -1987,16 +1993,38 @@ class TrainingService:
         return logits.astype(np.float32, copy=False), basal_currents.astype(np.float32, copy=False)
 
     @staticmethod
-    def _nll_from_logits(logits: np.ndarray, labels: np.ndarray) -> Tuple[float, np.ndarray]:
+    def _nll_from_logits(
+        logits: np.ndarray,
+        labels: np.ndarray,
+        *,
+        num_classes: Optional[int] = None,
+    ) -> Tuple[float, np.ndarray]:
         if logits.ndim != 2:
             raise ValueError("logits tensor must be 2D (batch, classes)")
+        if num_classes is None:
+            num_classes = logits.shape[1]
+        if logits.shape[1] != num_classes:
+            raise AssertionError(
+                f"logits second dimension must equal num_classes={num_classes}, got {logits.shape[1]}"
+            )
         if labels.dtype != np.int64:
             raise TypeError(f"labels must be int64 for indexing, got {labels.dtype}")
+        if labels.size and labels.shape[0] != logits.shape[0]:
+            raise ValueError("labels length must match logits batch size")
+        if labels.ndim not in (0, 1):
+            raise ValueError("labels must be a 1D array")
+        if labels.size:
+            y_min = int(labels.min())
+            y_max = int(labels.max())
+            if y_min < 0 or y_max >= num_classes:
+                raise AssertionError(f"labels out of range [{y_min}, {y_max}] for num_classes={num_classes}")
         shifted = logits - np.max(logits, axis=1, keepdims=True)
         exp_shifted = np.exp(shifted, dtype=np.float64)
         denom = np.clip(np.sum(exp_shifted, axis=1, keepdims=True), 1e-12, None)
         log_probs = shifted - np.log(denom)
         probs = np.exp(log_probs).astype(np.float32, copy=False)
+        if not np.allclose(np.sum(probs, axis=1), 1.0, atol=1e-4):
+            raise AssertionError("probabilities must sum to 1 along class dimension")
         if labels.size == 0:
             return 0.0, probs.astype(logits.dtype, copy=False)
         row_idx = np.arange(labels.shape[0])
@@ -2212,7 +2240,7 @@ class TrainingService:
             head_inputs = head_inputs.astype(np.float32, copy=False)
             head_outputs, _ = model.head.forward(head_inputs, return_cache=False)
             logits = head_outputs * (model.logit_scale / temperature)
-            loss, probs = self._nll_from_logits(logits, batch_y)
+            loss, probs = self._nll_from_logits(logits, batch_y, num_classes=dataset.num_classes)
             batch_size_actual = batch_x.shape[0]
             losses.append(loss)
             batch_acc, top5_acc, confidence, entropy, _ = self._classification_metrics(probs, batch_y)

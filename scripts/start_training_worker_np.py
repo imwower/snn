@@ -29,6 +29,8 @@ import yaml
 from nats.aio.client import Client as NATS
 from nats.errors import Error as NatsError
 
+from snn.data import DATASET_IMAGE_SHAPES, ensure_feature_stats, standardize_batch
+
 
 LOGGER = logging.getLogger("training_worker_np")
 
@@ -83,6 +85,7 @@ class HyperParams:
     contraction_rho: float = 0.9
     contraction_lambda: float = 0.0
     fp_tolerance: float = 1e-5
+    augment: bool = True
 
 
 @dataclass(frozen=True)
@@ -169,6 +172,9 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
     worker_raw = raw.get("training_worker", {})
     if not isinstance(worker_raw, dict):
         raise ValueError("`training_worker` block must be a mapping in config.yaml")
+
+    train_overrides_raw = raw.get("train")
+    train_overrides = train_overrides_raw if isinstance(train_overrides_raw, dict) else None
 
     mode = (override_mode or worker_raw.get("mode") or "tstep").lower()
     if mode not in {"tstep", "fpt"}:
@@ -276,6 +282,9 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
     if contraction_rho <= 0.0:
         contraction_rho = 0.0
     contraction_lambda = max(0.0, contraction_lambda)
+    augment_value = bool(hyper_raw.get("augment", True))
+    if train_overrides and "augment" in train_overrides:
+        augment_value = bool(train_overrides["augment"])
 
     hyper = HyperParams(
         epochs=int(hyper_raw.get("epochs", 1)),
@@ -305,6 +314,7 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         contraction_rho=contraction_rho,
         contraction_lambda=contraction_lambda,
         fp_tolerance=fp_tol_value,
+        augment=augment_value,
     )
 
     nats_raw = worker_raw.get("nats", {})
@@ -402,14 +412,30 @@ def softmax(logits: np.ndarray) -> np.ndarray:
     return probs.astype(logits.dtype, copy=False)
 
 
-def nll_from_logits(logits: np.ndarray, targets: np.ndarray) -> Tuple[float, np.ndarray]:
+def nll_from_logits(
+    logits: np.ndarray,
+    targets: np.ndarray,
+    *,
+    num_classes: Optional[int] = None,
+) -> Tuple[float, np.ndarray]:
     if logits.ndim != 2:
         raise ValueError("logits must be a 2D array")
+    if num_classes is None:
+        num_classes = logits.shape[1]
+    if logits.shape[1] != num_classes:
+        raise AssertionError(f"logits second dimension must equal num_classes={num_classes}, got {logits.shape[1]}")
     if targets.dtype != np.int64:
         raise TypeError("labels must be np.int64 for indexing")
     batch_size = logits.shape[0]
-    if targets.shape and targets.shape[0] not in {0, batch_size}:
+    if targets.size and targets.shape[0] != batch_size:
         raise ValueError("targets must match logits batch dimension")
+    if targets.ndim not in (0, 1):
+        raise ValueError("targets must be a 1D array")
+    if targets.size:
+        y_min = int(targets.min())
+        y_max = int(targets.max())
+        if y_min < 0 or y_max >= num_classes:
+            raise AssertionError(f"labels out of range [{y_min}, {y_max}] for num_classes={num_classes}")
     logits64 = logits.astype(np.float64, copy=False)
     max_logits = np.max(logits64, axis=1, keepdims=True)
     shifted = logits64 - max_logits
@@ -417,6 +443,8 @@ def nll_from_logits(logits: np.ndarray, targets: np.ndarray) -> Tuple[float, np.
     denom = np.clip(np.sum(exp_shifted, axis=1, keepdims=True), 1e-12, None)
     log_probs = shifted - np.log(denom)
     probs = np.exp(log_probs).astype(logits.dtype, copy=False)
+    if not np.allclose(np.sum(probs, axis=1), 1.0, atol=1e-4):
+        raise AssertionError("probabilities must sum to 1 along class dimension")
     if targets.size == 0:
         return 0.0, probs
     row_idx = np.arange(targets.shape[0])
@@ -426,35 +454,48 @@ def nll_from_logits(logits: np.ndarray, targets: np.ndarray) -> Tuple[float, np.
     return loss, probs
 
 
+def topk_acc(probs: np.ndarray, targets: np.ndarray, k: int = 5) -> float:
+    if probs.ndim != 2:
+        raise ValueError("probabilities must be a 2D array")
+    if targets.size == 0 or probs.shape[0] == 0 or k <= 0:
+        return 0.0
+    k = min(k, probs.shape[1])
+    idx = np.argpartition(-probs, k - 1, axis=1)[:, :k]
+    hits = np.any(idx == targets[:, None], axis=1)
+    return float(np.mean(hits))
+
+
 def classification_stats(probs: np.ndarray, targets: np.ndarray) -> Tuple[float, float, float, float]:
     if probs.ndim != 2:
         raise ValueError("probabilities must be a 2D array")
     batch = probs.shape[0]
-    if batch == 0:
+    if batch == 0 or targets.size == 0:
         return 0.0, 0.0, 0.0, 0.0
+    if targets.dtype != np.int64:
+        raise TypeError("targets must be np.int64 for metrics")
+    if targets.ndim != 1 or targets.shape[0] != batch:
+        raise ValueError("targets must be a 1D array aligned with probabilities batch size")
+
+    sums = np.sum(probs, axis=1)
+    if not np.allclose(sums, 1.0, atol=1e-4):
+        raise AssertionError("probabilities must sum to 1 along class dimension")
+
+    num_classes = probs.shape[1]
+    y_min = int(targets.min())
+    y_max = int(targets.max())
+    if y_min < 0 or y_max >= num_classes:
+        raise AssertionError(f"targets out of range [{y_min}, {y_max}] for num_classes={num_classes}")
 
     probs64 = probs.astype(np.float64, copy=False)
     probs_safe = np.clip(probs64, 1e-12, 1.0)
     entropy_values = -np.sum(probs_safe * np.log(probs_safe), axis=1)
     entropy = float(np.mean(entropy_values)) if entropy_values.size else 0.0
 
-    if targets.size == 0:
-        return 0.0, 0.0, 0.0, entropy
-    if targets.shape[0] != batch:
-        raise ValueError("targets length must match probabilities batch size")
-
     preds = np.argmax(probs, axis=1)
+    if preds.shape != targets.shape:
+        raise AssertionError("predictions shape must match labels")
     top1 = float(np.mean(preds == targets))
-
-    classes = probs.shape[1]
-    k = min(5, classes)
-    if k > 0:
-        partition = np.argpartition(-probs, k - 1, axis=1)[:, :k]
-        hits = np.any(partition == targets[:, None], axis=1)
-        top5 = float(np.mean(hits))
-    else:
-        top5 = 0.0
-
+    top5 = topk_acc(probs, targets, k=min(5, num_classes))
     confidence = float(np.mean(probs[np.arange(batch), targets]))
     return top1, top5, confidence, entropy
 
@@ -495,6 +536,177 @@ def load_datasets(cfg: DatasetConfig, timesteps: int, input_dim: int) -> Tuple[n
             f"val inputs must be (N, {timesteps}, {input_dim}), got {val_x.shape}"
         )
     return train_x, train_y, val_x, val_y
+
+
+def _dataset_stats_directory(cfg: DatasetConfig) -> Path:
+    return (cfg.root / cfg.train_file).parent
+
+
+def _infer_dataset_name(cfg: DatasetConfig) -> str:
+    train_path = cfg.root / cfg.train_file
+    dataset_dir = train_path.parent
+    if dataset_dir.name:
+        return dataset_dir.name
+    stem = train_path.stem
+    return stem or "dataset"
+
+
+def _resolve_image_shape(cfg: DatasetConfig, feature_dim: int) -> Optional[Tuple[int, int, int]]:
+    candidates = []
+    name = _infer_dataset_name(cfg)
+    if name:
+        candidates.append(name.upper())
+        candidates.append(name.replace("_", "-").upper())
+        candidates.append(name.replace("-", "_").upper())
+        candidates.append(name.replace("-", "").replace("_", "").upper())
+    for candidate in candidates:
+        shape = DATASET_IMAGE_SHAPES.get(candidate)
+        if shape and int(np.prod(shape)) == feature_dim:
+            return shape
+    return None
+
+
+def _flatten_sequences(data: np.ndarray) -> np.ndarray:
+    if data.ndim < 2:
+        raise ValueError("inputs must be at least 2D (batch, ...)")
+    return data.reshape(data.shape[0], -1)
+
+
+def _standardize_sequences(data: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    flat = _flatten_sequences(data)
+    standardized = standardize_batch(flat, mean, std)
+    return standardized.reshape(data.shape)
+
+
+def _augment_image_sequences(
+    batch: np.ndarray,
+    image_shape: Tuple[int, int, int],
+    rng: np.random.Generator,
+    *,
+    max_translate: int = 2,
+    max_crop: int = 2,
+) -> np.ndarray:
+    if batch.size == 0:
+        return batch
+    if rng is None:
+        raise ValueError("rng must be provided when augmentation is enabled")
+    batch_size, timesteps, feature_dim = batch.shape
+    h, w, c = image_shape
+    if feature_dim != h * w * c:
+        return batch
+    augmented = np.empty_like(batch)
+    pad_spatial = (
+        (0, 0),
+        (max_translate, max_translate),
+        (max_translate, max_translate),
+        (0, 0),
+    )
+    for idx in range(batch_size):
+        frames = batch[idx].reshape(timesteps, h, w, c)
+        padded = np.pad(frames, pad_spatial, mode="constant")
+        y_offset = int(rng.integers(0, max_translate * 2 + 1))
+        x_offset = int(rng.integers(0, max_translate * 2 + 1))
+        translated = padded[:, y_offset : y_offset + h, x_offset : x_offset + w, :]
+        if rng.random() < 0.5:
+            translated = translated[:, :, ::-1, :]
+        crop_top = int(rng.integers(0, max_crop + 1))
+        crop_bottom = int(rng.integers(0, max_crop + 1))
+        crop_left = int(rng.integers(0, max_crop + 1))
+        crop_right = int(rng.integers(0, max_crop + 1))
+        y_start = min(crop_top, h - 1)
+        y_end = max(y_start + 1, h - crop_bottom)
+        y_end = min(y_end, h)
+        x_start = min(crop_left, w - 1)
+        x_end = max(x_start + 1, w - crop_right)
+        x_end = min(x_end, w)
+        cropped = translated[:, y_start:y_end, x_start:x_end, :]
+        pad_back = (
+            (0, 0),
+            (crop_top, crop_bottom),
+            (crop_left, crop_right),
+            (0, 0),
+        )
+        restored = np.pad(cropped, pad_back, mode="constant")[:, :h, :w, :]
+        augmented[idx] = restored.reshape(timesteps, feature_dim)
+    return augmented
+
+
+def _prepare_batch_inputs(
+    batch: np.ndarray,
+    feature_mean: np.ndarray,
+    feature_std: np.ndarray,
+    *,
+    augment: bool,
+    image_shape: Optional[Tuple[int, int, int]],
+    rng: Optional[np.random.Generator],
+) -> np.ndarray:
+    prepared = batch.astype(np.float32, copy=False)
+    if augment and image_shape is not None:
+        if rng is None:
+            raise ValueError("rng must be provided when augmentation is enabled")
+        prepared = _augment_image_sequences(prepared, image_shape, rng)
+    standardized = _standardize_sequences(prepared, feature_mean, feature_std)
+    if not np.all(np.isfinite(standardized)):
+        raise FloatingPointError("非有限的输入特征，标准化或增广流程异常")
+    return standardized
+
+
+def _summarize_feature_stats(
+    dataset_name: str,
+    mean: np.ndarray,
+    std: np.ndarray,
+) -> Tuple[str, Dict[str, Any]]:
+    flat_mean = mean.reshape(-1)
+    flat_std = std.reshape(-1)
+    if flat_mean.size == 0 or flat_std.size == 0:
+        raise ValueError("feature statistics cannot be empty")
+
+    def _window(values: np.ndarray) -> List[float]:
+        return [round(float(v), 4) for v in values.tolist()]
+
+    mean_head = _window(flat_mean[:3])
+    mean_tail = _window(flat_mean[-3:])
+    std_head = _window(flat_std[:3])
+    std_tail = _window(flat_std[-3:])
+    mean_span = float(np.max(flat_mean) - np.min(flat_mean))
+    std_min = float(np.min(flat_std))
+    std_max = float(np.max(flat_std))
+    mean_all_zero = bool(np.allclose(flat_mean, 0.0))
+    std_all_one = bool(np.allclose(flat_std, 1.0))
+    metric = {
+        "dataset": dataset_name,
+        "mean_head": mean_head,
+        "mean_tail": mean_tail,
+        "std_head": std_head,
+        "std_tail": std_tail,
+        "mean_span": mean_span,
+        "std_min": std_min,
+        "std_max": std_max,
+        "mean_all_zero": mean_all_zero,
+        "std_all_one": std_all_one,
+    }
+    message = (
+        f"[data] dataset={dataset_name} mean_head={mean_head} mean_tail={mean_tail} "
+        f"std_head={std_head} std_tail={std_tail} span={mean_span:.4f} "
+        f"std_min={std_min:.4f} std_max={std_max:.4f} mean_all_zero={mean_all_zero} "
+        f"std_all_one={std_all_one}"
+    )
+    return message, metric
+
+
+def _iter_epoch_batches(
+    total_examples: int,
+    batch_size: int,
+    rng: np.random.Generator,
+) -> Iterable[np.ndarray]:
+    if total_examples <= 0:
+        return
+    order = rng.permutation(total_examples)
+    for start in range(0, total_examples, batch_size):
+        end = min(start + batch_size, total_examples)
+        batch_idx = order[start:end]
+        if batch_idx.size:
+            yield batch_idx
 
 
 # ---------------------------------------------------------------------------
@@ -912,7 +1124,7 @@ class Trainer:
         if logits.ndim != 2 or logits.shape[1] != num_classes:
             raise ValueError(f"logits must be (batch,{num_classes}), got {logits.shape}")
 
-        nll, probs = nll_from_logits(logits, batch_y)
+        nll, probs = nll_from_logits(logits, batch_y, num_classes=num_classes)
         acc, top5, confidence, entropy = classification_stats(probs, batch_y)
         logit_mean, logit_std = self._truth_probe(
             logits,
@@ -1006,7 +1218,7 @@ class Trainer:
         logits = pre_logits / temp_value
         assert logits.shape[1] == num_classes, "logit dimension mismatch"
 
-        nll, probs = nll_from_logits(logits, batch_y)
+        nll, probs = nll_from_logits(logits, batch_y, num_classes=num_classes)
         acc, top5, confidence, entropy = classification_stats(probs, batch_y)
         logit_mean, logit_std = self._truth_probe(
             logits,
@@ -1241,7 +1453,7 @@ class Trainer:
                 scaled_state = self._scale_output_features(final_state)
                 logits = scaled_state @ self.model.Wo.T + self.model.bo
             logits = logits / temp_value
-            loss, probs = nll_from_logits(logits, batch_y)
+            loss, probs = nll_from_logits(logits, batch_y, num_classes=self.model.network.output_dim)
             acc, top5, confidence, entropy = classification_stats(probs, batch_y)
             batch_count = batch_x.shape[0]
             total_loss += loss * batch_count
@@ -1302,13 +1514,6 @@ class Trainer:
 # ---------------------------------------------------------------------------
 
 
-def _batch_iterator(data_x: np.ndarray, data_y: np.ndarray, batch_size: int) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
-    total = data_x.shape[0]
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        yield data_x[start:end], data_y[start:end]
-
-
 async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = None) -> None:
     rng = np.random.default_rng(worker_cfg.hyper.seed)
     model = ThreeCompartmentModel(worker_cfg.network, worker_cfg.neuron, rng)
@@ -1318,14 +1523,48 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
         worker_cfg.hyper.timesteps,
         worker_cfg.network.input_dim,
     )
+    total_examples = train_x.shape[0]
+    if total_examples == 0:
+        raise RuntimeError("训练集样本数量为 0，无法开始训练")
+
+    dataset_dir = _dataset_stats_directory(worker_cfg.dataset)
+    dataset_label = _infer_dataset_name(worker_cfg.dataset)
+    train_flat = _flatten_sequences(train_x)
+    feature_mean, feature_std = ensure_feature_stats(train_flat, dataset_dir)
+    if not np.all(np.isfinite(feature_mean)) or not np.all(np.isfinite(feature_std)):
+        raise FloatingPointError("特征统计包含非有限值")
+    val_x_prepared = _standardize_sequences(val_x, feature_mean, feature_std)
+    image_shape = _resolve_image_shape(worker_cfg.dataset, worker_cfg.network.input_dim)
+    augment_enabled = bool(worker_cfg.hyper.augment)
+    apply_augment = augment_enabled and image_shape is not None
+    data_rng = np.random.default_rng(worker_cfg.hyper.seed + 1)
+    stats_message, stats_metric = _summarize_feature_stats(dataset_label, feature_mean, feature_std)
 
     epochs = override_epochs or worker_cfg.hyper.epochs
     trainer = Trainer(worker_cfg, model)
 
-    steps_per_epoch = math.ceil(train_x.shape[0] / worker_cfg.hyper.batch_size)
+    steps_per_epoch = math.ceil(total_examples / worker_cfg.hyper.batch_size)
     total_steps = max(1, epochs * steps_per_epoch)
     async with NatsPublisher(worker_cfg.nats) as publisher:
-        LOGGER.info("Starting training: mode=%s epochs=%d batches=%d", worker_cfg.mode, epochs, len(train_x))
+        LOGGER.info(
+            "Starting training: mode=%s epochs=%d steps_per_epoch=%d samples=%d augment=%s",
+            worker_cfg.mode,
+            epochs,
+            steps_per_epoch,
+            total_examples,
+            "on" if apply_augment else "off",
+        )
+        await publisher.publish_json(
+            worker_cfg.nats.subjects.logs,
+            {
+                "level": "INFO",
+                "msg": stats_message,
+                "time_unix": current_millis(),
+                "metric": stats_metric,
+            },
+        )
+        if augment_enabled and not apply_augment:
+            LOGGER.info("数据集 %s 未匹配到图像形状，跳过增广", dataset_label)
         global_step = 0
         last_lr = worker_cfg.hyper.lr
         for epoch in range(epochs):
@@ -1343,14 +1582,22 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
             epoch_logit_sum = 0.0
             epoch_logit_sq_sum = 0.0
             epoch_logit_count = 0
-            if epochs <= 1:
-                progress = 1.0
-            else:
-                progress = epoch / max(1, epochs - 1)
+            progress = 1.0 if epochs <= 1 else epoch / max(1, epochs - 1)
             g_apical_value, beta_override, threshold_override = trainer.resolve_annealed_params(progress)
             if worker_cfg.mode == "fpt":
                 trainer.refresh_truncation(epoch, epochs)
-            for batch_x, batch_y in _batch_iterator(train_x, train_y, worker_cfg.hyper.batch_size):
+            batch_iter = _iter_epoch_batches(total_examples, worker_cfg.hyper.batch_size, data_rng)
+            for step_idx, batch_indices in enumerate(batch_iter, start=1):
+                raw_batch_x = train_x[batch_indices]
+                batch_y = train_y[batch_indices]
+                prepared_batch = _prepare_batch_inputs(
+                    raw_batch_x,
+                    feature_mean,
+                    feature_std,
+                    augment=apply_augment,
+                    image_shape=image_shape,
+                    rng=data_rng if apply_augment else None,
+                )
                 step_start = time.perf_counter()
                 global_step += 1
                 current_lr = _cosine_decay(
@@ -1362,7 +1609,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 last_lr = current_lr
                 try:
                     result = trainer.train_batch(
-                        batch_x,
+                        prepared_batch,
                         batch_y,
                         current_lr,
                         apical_coupling=g_apical_value,
@@ -1374,34 +1621,56 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                         worker_cfg.nats.subjects.logs,
                         {
                             "level": "ERROR",
-                            "msg": f"[TSTEP] epoch={epoch} step={step + 1} failed: {exc}",
+                            "msg": f"[TSTEP] epoch={epoch} step={step_idx} failed: {exc}",
                             "time_unix": current_millis(),
                         },
                     )
                     break
+                if step_idx == 1:
+                    sanity_std = float(result.logit_std or 0.0)
+                    sanity_conf = float(result.confidence)
+                    sanity_entropy = float(result.entropy)
+                    sanity_metric = {
+                        "epoch": epoch + 1,
+                        "logit_std": sanity_std,
+                        "conf": sanity_conf,
+                        "entropy": sanity_entropy,
+                    }
+                    await publisher.publish_json(
+                        worker_cfg.nats.subjects.logs,
+                        {
+                            "level": "INFO",
+                            "msg": (
+                                f"[batch_sanity] epoch={epoch + 1} "
+                                f"logit_std={sanity_std:.4f} conf={sanity_conf:.4f} entropy={sanity_entropy:.4f}"
+                            ),
+                            "time_unix": current_millis(),
+                            "metric": sanity_metric,
+                        },
+                    )
                 step_duration = max(time.perf_counter() - step_start, 1e-6)
-                batch_size = batch_x.shape[0]
-                epoch_loss += result.loss * batch_size
-                epoch_nll += result.nll * batch_size
-                epoch_acc += result.acc * batch_size
-                epoch_top5 += result.top5 * batch_size
-                epoch_conf += result.confidence * batch_size
-                epoch_entropy += result.entropy * batch_size
-                epoch_examples += batch_size
-                throughput = float(batch_size / step_duration)
+                batch_count = prepared_batch.shape[0]
+                epoch_loss += result.loss * batch_count
+                epoch_nll += result.nll * batch_count
+                epoch_acc += result.acc * batch_count
+                epoch_top5 += result.top5 * batch_count
+                epoch_conf += result.confidence * batch_count
+                epoch_entropy += result.entropy * batch_count
+                epoch_examples += batch_count
+                throughput = float(batch_count / step_duration)
                 epoch_throughputs.append(throughput)
                 if result.residual is not None:
                     epoch_residuals.append(result.residual)
                 if result.logit_mean is not None and result.logit_std is not None:
-                    logits_per_batch = batch_size * worker_cfg.network.output_dim
+                    logits_per_batch = batch_count * worker_cfg.network.output_dim
                     epoch_logit_sum += result.logit_mean * logits_per_batch
                     epoch_logit_sq_sum += (
                         (result.logit_std ** 2 + result.logit_mean ** 2) * logits_per_batch
                     )
                     epoch_logit_count += logits_per_batch
                 if result.s_rate is not None:
-                    epoch_rate_sum += float(result.s_rate) * batch_size
-                    epoch_rate_count += batch_size
+                    epoch_rate_sum += float(result.s_rate) * batch_count
+                    epoch_rate_count += batch_count
 
                 if global_step % 10 == 0:
                     metrics_payload: Dict[str, Any] = {
@@ -1417,7 +1686,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                         "lr": current_lr,
                         "temperature": trainer.temperature,
                         "mode": worker_cfg.mode,
-                        "examples": batch_size,
+                        "examples": batch_count,
                         "throughput": throughput,
                         "step_ms": step_duration * 1000.0,
                         "time_unix": current_millis(),
@@ -1470,7 +1739,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 val_logit_mean,
                 val_logit_std,
             ) = trainer.evaluate(
-                val_x,
+                val_x_prepared,
                 val_y,
                 worker_cfg.hyper.batch_size,
                 apical_coupling=g_apical_value,
