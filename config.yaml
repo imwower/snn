@@ -104,9 +104,15 @@ training_service:
   temperature: 1.0
   logit_scale: 1.25
   logit_scale_learnable: false
+  logit_scale_init: 1.25
+  logit_scale_min: 0.5
+  logit_scale_max: 3.0
   tstep_regularization:
     rate_reg_lambda: 0.001
     rate_target: 0.2
   rate_reg_lambda: 0.001
   rate_target: 0.2
   augment: true
+  head_hidden: 64
+  head_momentum: 0.9
+  unfreeze_at_conf: 0.13

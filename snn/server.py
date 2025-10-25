@@ -37,6 +37,7 @@ except Exception:  # pragma: no cover - 未安装 nats-py
 from .config import get_message_queue_config, load_config
 from .data import DATASET_IMAGE_SHAPES, ensure_feature_stats, standardize_batch, augment_flat_batch
 from .fpt import FixedPointConfig, fixed_point_parallel_solve
+from .models import ReadoutMLP
 from .mq import InMemoryQueue, Message, MessageQueue, build_message_queue
 from .neuron import ThreeCompartmentParams
 
@@ -204,6 +205,7 @@ class ModelState:
     b_basal: np.ndarray  # (num_classes, timesteps)
     b_out: np.ndarray    # (num_classes,)
     logit_scale: float
+    head: ReadoutMLP
 
 
 def _read_idx_images(path: Path) -> np.ndarray:
@@ -850,6 +852,12 @@ class TrainingService:
             "rate_target": 0.2,
             "steps_per_epoch": None,
             "augment": True,
+            "head_hidden": 64,
+            "head_momentum": 0.9,
+            "logit_scale_init": 1.25,
+            "logit_scale_min": 0.5,
+            "logit_scale_max": 3.0,
+            "unfreeze_at_conf": 0.13,
         }
         self._config = self._apply_overrides(base_config, defaults or {})
         self._task: Optional[asyncio.Task[None]] = None
@@ -899,6 +907,12 @@ class TrainingService:
             "rate_target",
             "steps_per_epoch",
             "augment",
+            "head_hidden",
+            "head_momentum",
+            "logit_scale_init",
+            "logit_scale_min",
+            "logit_scale_max",
+            "unfreeze_at_conf",
         ]
         for field in simple_fields:
             if field in overrides and not isinstance(overrides[field], dict):
@@ -1123,6 +1137,11 @@ class TrainingService:
                 "rate_reg_lambda": self._config.get("rate_reg_lambda"),
                 "rate_target": self._config.get("rate_target"),
                 "augment": bool(self._config.get("augment", True)),
+                "head_hidden": self._config.get("head_hidden"),
+                "head_momentum": self._config.get("head_momentum"),
+                "logit_scale_min": self._config.get("logit_scale_min"),
+                "logit_scale_max": self._config.get("logit_scale_max"),
+                "unfreeze_at_conf": self._config.get("unfreeze_at_conf"),
                 "time_unix": _current_millis(),
             },
         )
@@ -1207,10 +1226,24 @@ class TrainingService:
         min_lr = float(max(1e-9, min_lr_override if min_lr_override is not None else base_lr * min_lr_scale))
         weight_decay = float(max(0.0, _train_param("weight_decay", config.get("weight_decay", 1e-4))))
         temperature = float(max(1e-6, _train_param("temperature", 1.0)))
+        head_hidden = int(max(4, _train_param("head_hidden", config.get("head_hidden", 64))))
+        head_momentum = float(_train_param("head_momentum", config.get("head_momentum", 0.9)))
+        head_momentum = float(np.clip(head_momentum, 0.0, 0.999))
+        logit_scale_init = float(max(1e-6, _train_param("logit_scale_init", config.get("logit_scale_init", 1.25))))
         initial_logit_scale = float(
-            max(1e-6, _train_param("logit_scale", config.get("logit_scale", 1.25)))
+            max(1e-6, _train_param("logit_scale", config.get("logit_scale", logit_scale_init)))
         )
-        logit_scale_learnable = bool(_train_param("logit_scale_learnable", False))
+        logit_scale_min = float(max(1e-6, _train_param("logit_scale_min", config.get("logit_scale_min", 0.5))))
+        logit_scale_max = float(
+            max(
+                logit_scale_min + 1e-5,
+                _train_param("logit_scale_max", config.get("logit_scale_max", 3.0)),
+            )
+        )
+        logit_scale_learnable = bool(_train_param("logit_scale_learnable", True))
+        unfreeze_threshold = float(
+            max(0.0, _train_param("unfreeze_at_conf", config.get("unfreeze_at_conf", 0.13)))
+        )
         k_schedule_label = k_schedule_raw or "none"
         rate_reg_lambda = float(
             max(0.0, _train_param("rate_reg_lambda", config.get("rate_reg_lambda", 1e-3)))
@@ -1225,8 +1258,22 @@ class TrainingService:
         epochs = max(1, int(config.get("epochs", 1)))
         ema_decay = 0.9
 
-        model = self._init_model(dataset.input_dim, timesteps, num_classes, np_rng, initial_logit_scale)
+        model = self._init_model(
+            dataset.input_dim,
+            timesteps,
+            num_classes,
+            np_rng,
+            initial_logit_scale,
+            head_hidden=head_hidden,
+            head_momentum=head_momentum,
+        )
         self._model_state = model
+        self._config["logit_scale"] = initial_logit_scale
+        self._config["logit_scale_min"] = logit_scale_min
+        self._config["logit_scale_max"] = logit_scale_max
+        self._config["head_hidden"] = head_hidden
+        self._config["head_momentum"] = head_momentum
+        self._config["unfreeze_at_conf"] = unfreeze_threshold
 
         train_x = dataset.train_x
         train_y = dataset.train_y
@@ -1252,7 +1299,8 @@ class TrainingService:
                 f"using solver={solver} K={base_iterations} T={timesteps} "
                 f"temperature={temperature} K_schedule={k_schedule_label} "
                 f"scheduler={scheduler_name} warmup={warmup_steps} steps_per_epoch={steps_per_epoch} "
-                f"rate_reg={rate_reg_value} grad_clip={grad_clip} augment={'on' if augment_enabled else 'off'}"
+                f"rate_reg={rate_reg_value} grad_clip={grad_clip} head_hidden={head_hidden} "
+                f"augment={'on' if augment_enabled else 'off'}"
             ),
             metric={
                 "solver": solver,
@@ -1271,6 +1319,11 @@ class TrainingService:
                 "weight_decay": weight_decay,
                 "steps_per_epoch": steps_per_epoch,
                 "augment": augment_enabled,
+                "head_hidden": head_hidden,
+                "head_momentum": head_momentum,
+                "logit_scale_min": logit_scale_min,
+                "logit_scale_max": logit_scale_max,
+                "unfreeze_at_conf": unfreeze_threshold,
             },
         )
         await self._emit_log(
@@ -1278,7 +1331,7 @@ class TrainingService:
             (
                 "config summary: mode=%s lr=%.5f min_lr=%.5f weight_decay=%.4f grad_clip=%.2f "
                 "scheduler=%s warmup_steps=%d steps_per_epoch=%d logit_scale=%.3f rate_target=%s "
-                "augment=%s"
+                "augment=%s head_hidden=%d unfreeze_at_conf=%.3f"
             )
             % (
                 config.get("mode", "fpt"),
@@ -1292,6 +1345,8 @@ class TrainingService:
                 initial_logit_scale,
                 rate_target,
                 "on" if augment_enabled else "off",
+                head_hidden,
+                unfreeze_threshold,
             ),
         )
 
@@ -1317,6 +1372,7 @@ class TrainingService:
         best_loss = float("inf")
         ema_loss: Optional[float] = None
         ema_acc: Optional[float] = None
+        head_frozen = unfreeze_threshold > 0.0
 
         try:
             for epoch in range(1, epochs + 1):
@@ -1397,16 +1453,20 @@ class TrainingService:
                         raise AssertionError(
                             f"logits second dimension must equal num_classes={num_classes}, got {logits_raw.shape[1]}"
                         )
-                    batch_s_rate = 0.0
                     grad_kernel = kernel
-                    logits_source = logits_raw
+                    head_inputs = logits_raw
+                    batch_s_rate = 0.0
                     if is_tstep_mode:
                         s_mean = np.mean(basal_currents, axis=2)
-                        logits_source = s_mean + model.b_out[None, :]
+                        head_inputs = s_mean
                         grad_kernel = np.full_like(kernel, 1.0 / max(1, timesteps), dtype=kernel.dtype)
                         batch_s_rate = float(np.mean(s_mean)) if s_mean.size else 0.0
+                    else:
+                        head_inputs = logits_raw
+                    head_inputs = head_inputs.astype(np.float32, copy=False)
+                    head_outputs, head_cache = model.head.forward(head_inputs, return_cache=True)
                     scale_factor = model.logit_scale / temperature
-                    logits = logits_source * scale_factor
+                    logits = head_outputs * scale_factor
                     nll, probs = self._nll_from_logits(logits, batch_y)
                     loss = nll
                     if is_tstep_mode and rate_reg_lambda > 0.0:
@@ -1416,16 +1476,20 @@ class TrainingService:
                     if batch_y.size:
                         grad_logits_scaled[np.arange(batch_y.shape[0]), batch_y] -= 1.0
                     grad_logits_scaled /= max(batch_y.shape[0], 1)
-                    grad_logits = grad_logits_scaled * scale_factor
+                    grad_head_logits = grad_logits_scaled * scale_factor
+                    grad_head_inputs, head_grads = model.head.backward(grad_head_logits, head_cache)
+                    model.head.apply_gradients(head_grads, current_lr, weight_decay=weight_decay)
                     batch_acc, top5_acc, confidence, entropy, predictions = self._classification_metrics(
                         probs, batch_y
                     )
                     logit_mean = float(np.mean(logits)) if logits.size else 0.0
                     logit_std = float(np.std(logits)) if logits.size else 0.0
-                    logit_scale_grad = None
                     if logit_scale_learnable:
-                        inv_temp = 1.0 / temperature
-                        logit_scale_grad = float(np.sum(grad_logits_scaled * logits_source) * inv_temp)
+                        logit_scale_grad = float(np.sum(grad_logits_scaled * head_outputs) / temperature)
+                        updated_scale = model.logit_scale - current_lr * logit_scale_grad
+                        model.logit_scale = float(np.clip(updated_scale, logit_scale_min, logit_scale_max))
+                    else:
+                        model.logit_scale = float(np.clip(model.logit_scale, logit_scale_min, logit_scale_max))
                     if step == 0:
                         await self._emit_log(
                             "INFO",
@@ -1453,13 +1517,25 @@ class TrainingService:
                         epoch_logit_sum += float(np.sum(logits))
                         epoch_logit_sq_sum += float(np.sum(logits ** 2))
                         epoch_logit_count += logits.size
-                    grads = self._compute_gradients(batch_x, grad_logits, grad_kernel)
-                    extra_grads = None
-                    if logit_scale_grad is not None:
-                        extra_grads = {"logit_scale": np.array([logit_scale_grad], dtype=np.float32)}
-                    grad_norm = _clip_gradients_inplace(grads, grad_clip, extra_grads)
-                    if extra_grads is not None:
-                        logit_scale_grad = float(extra_grads["logit_scale"][0])
+                    grad_norm = 0.0
+                    if head_frozen and unfreeze_threshold > 0.0 and confidence >= unfreeze_threshold:
+                        head_frozen = False
+                        await self._emit_log(
+                            "INFO",
+                            f"Backbone unfrozen at confidence={confidence:.4f} (epoch={epoch}, step={step + 1})",
+                        )
+                    if not head_frozen:
+                        grad_logits = grad_head_inputs
+                        grads = self._compute_gradients(batch_x, grad_logits, grad_kernel)
+                        grad_norm = _clip_gradients_inplace(grads, grad_clip, None)
+                        self._apply_updates(
+                            model,
+                            grads,
+                            current_lr,
+                            weight_decay,
+                            learnable_logit_scale=False,
+                            logit_scale_grad=None,
+                        )
                     if batch_acc == 0.0 and zero_acc_logs < 3:
                         label_hist = np.bincount(batch_y, minlength=num_classes).tolist()
                         pred_hist = np.bincount(predictions, minlength=num_classes).tolist()
@@ -1474,15 +1550,6 @@ class TrainingService:
                         )
                         await self._emit_log("DEBUG", msg)
                         zero_acc_logs += 1
-    
-                    self._apply_updates(
-                        model,
-                        grads,
-                        current_lr,
-                        weight_decay,
-                        learnable_logit_scale=logit_scale_learnable,
-                        logit_scale_grad=logit_scale_grad,
-                    )
     
                     step_duration = max(time.perf_counter() - step_start, 1e-6)
                     throughput = float(batch_x.shape[0] / step_duration)
@@ -1891,12 +1958,22 @@ class TrainingService:
         num_classes: int,
         rng: np.random.Generator,
         logit_scale: float,
+        *,
+        head_hidden: int,
+        head_momentum: float,
     ) -> ModelState:
         scale = math.sqrt(2.0 / max(1, input_dim))
         W_basal = rng.normal(0.0, scale, size=(num_classes, timesteps, input_dim)).astype(np.float32)
         b_basal = np.zeros((num_classes, timesteps), dtype=np.float32)
         b_out = np.zeros(num_classes, dtype=np.float32)
-        return ModelState(W_basal=W_basal, b_basal=b_basal, b_out=b_out, logit_scale=float(logit_scale))
+        head = ReadoutMLP(num_classes, head_hidden, num_classes, rng, momentum=head_momentum)
+        return ModelState(
+            W_basal=W_basal,
+            b_basal=b_basal,
+            b_out=b_out,
+            logit_scale=float(logit_scale),
+            head=head,
+        )
 
     def _forward_batch(
         self,
@@ -2125,13 +2202,16 @@ class TrainingService:
                 continue
             batch_x = self._prepare_inputs(batch_x, dataset, rng=None, augment=False)
             logits_raw, basal_currents = self._forward_batch(model, batch_x, kernel)
-            logits_source = logits_raw
             batch_s_rate = 0.0
             if is_tstep:
                 s_mean = np.mean(basal_currents, axis=2)
-                logits_source = s_mean + model.b_out[None, :]
+                head_inputs = s_mean
                 batch_s_rate = float(np.mean(s_mean)) if s_mean.size else 0.0
-            logits = logits_source * (model.logit_scale / temperature)
+            else:
+                head_inputs = logits_raw
+            head_inputs = head_inputs.astype(np.float32, copy=False)
+            head_outputs, _ = model.head.forward(head_inputs, return_cache=False)
+            logits = head_outputs * (model.logit_scale / temperature)
             loss, probs = self._nll_from_logits(logits, batch_y)
             batch_size_actual = batch_x.shape[0]
             losses.append(loss)

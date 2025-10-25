@@ -132,6 +132,11 @@ export interface TrainInitEvent {
   weight_decay?: number;
   rate_target?: number;
   augment?: boolean;
+  head_hidden?: number;
+  head_momentum?: number;
+  logit_scale_min?: number;
+  logit_scale_max?: number;
+  unfreeze_at_conf?: number;
   time_unix?: number;
 }
 

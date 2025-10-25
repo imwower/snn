@@ -72,6 +72,8 @@ docker compose up -d
 
 默认训练配置会根据当前数据集样本数自动设置 `steps_per_epoch = ceil(N_{\text{train}} / batch_size)`，不再需要手动硬编码 128；同时在前向最后一步按 `logit_scale=1.25` 放大 logits。训练前端到端会以 NumPy 计算每个特征的 mean/std（存放在 `.data/datasets/<name>/mean.npy|std.npy`），并在训练阶段启用轻量增广（平移±2 像素、随机左右翻转、随机裁剪+Pad）以避免过拟合，可通过 `training_service.augment` 开关。
 
+读出层默认使用 NumPy 实现的两层 MLP（`in_dim → head_hidden → classes`，激活函数为 `tanh`），并携带可学习温度 `logit_scale`。相关超参可在 `training_service` 段配置：`head_hidden` / `head_momentum` 控制 MLP 隐层与动量，`logit_scale_init/min/max` 约束温度范围，`unfreeze_at_conf` 则决定读出头单独预热多久（当批次置信度超过该阈值后再解冻 FPT 主体权重）。
+
 ### 5.3 启动前端 UI
 
 ```bash
