@@ -1237,18 +1237,22 @@ class Trainer:
         mv_final = matrix @ v
         return float(np.linalg.norm(mv_final))
 
-    def enforce_contraction(self) -> None:
+    def enforce_contraction(self) -> Optional[Tuple[float, float]]:
         if self.cfg.mode != "fpt":
-            return
+            return None
         rho = max(0.0, self.contraction_rho)
         if rho <= 0.0:
-            return
+            return None
         spectral = self._estimate_spectral_norm(self.model.Whh)
-        if spectral <= 0.0 or spectral <= rho:
-            return
+        if spectral <= 0.0:
+            return None
+        if spectral <= rho:
+            LOGGER.debug("Spectral norm %.4f within limit %.4f", spectral, rho)
+            return spectral, 1.0
         scale = rho / spectral
         self.model.Whh *= scale
         LOGGER.info("Rescaled Whh spectral norm from %.4f to %.4f via contraction", spectral, rho)
+        return spectral, scale
 
     def _train_step_tstep(
         self,
@@ -1945,7 +1949,25 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 threshold_override=threshold_override,
             )
             if worker_cfg.mode == "fpt":
-                trainer.enforce_contraction()
+                contraction_info = trainer.enforce_contraction()
+                if contraction_info is not None:
+                    spec_norm, scale = contraction_info
+                    await publisher.publish_json(
+                        worker_cfg.nats.subjects.logs,
+                        {
+                            "level": "INFO",
+                            "msg": (
+                                f"[contract] epoch={epoch + 1} spec_norm(Whh)={spec_norm:.6f} "
+                                f"rescale={scale:.6f}"
+                            ),
+                            "time_unix": current_millis(),
+                            "metric": {
+                                "epoch": epoch + 1,
+                                "spec_norm": spec_norm,
+                                "rescale": scale,
+                            },
+                        },
+                    )
             avg_throughput = float(np.mean(epoch_throughputs)) if epoch_throughputs else None
             residual_mean = float(np.mean(epoch_residuals)) if epoch_residuals else None
 

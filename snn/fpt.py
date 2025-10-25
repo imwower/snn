@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional, Sequence, Tuple
+from typing import Callable, Deque, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -85,6 +85,69 @@ def _anderson_mix(
         mixed += weight * state
     beta_clamped = float(np.clip(beta, 0.0, 1.0))
     return (1.0 - beta_clamped) * prev + beta_clamped * mixed
+
+
+def fpt_solve(
+    phi: Callable[[np.ndarray], np.ndarray],
+    h0: np.ndarray,
+    K_max: int,
+    tol: float,
+    *,
+    solver: str = "anderson",
+    m: int = 4,
+    beta: float = 0.5,
+) -> Tuple[np.ndarray, int, float]:
+    """Generic fixed-point solver with optional Anderson acceleration.
+
+    Args:
+        phi: Callable that maps the previous iterate to the next candidate.
+        h0: Initial iterate vector.
+        K_max: Maximum number of iterations.
+        tol: Early-stop tolerance on the residual norm.
+        solver: "anderson" or "plain".
+        m: Anderson history length.
+        beta: Mixing factor for Anderson acceleration.
+
+    Returns:
+        (final_state, effective_iterations, final_residual)
+    """
+
+    if K_max <= 0:
+        raise ValueError("K_max must be positive")
+    if tol <= 0.0:
+        raise ValueError("tol must be positive")
+    h_prev = np.asarray(h0, dtype=np.float64)
+    solver_name = str(solver or "plain").lower()
+    use_anderson = solver_name == "anderson" and m > 1
+    history_states: Deque[np.ndarray] = deque(maxlen=max(1, int(m)))
+    history_residuals: Deque[np.ndarray] = deque(maxlen=max(1, int(m)))
+    beta_mix = float(np.clip(beta, 0.0, 1.0))
+    prev_residual = None
+    final_residual = float("inf")
+    effective_k = K_max
+    for iteration in range(1, K_max + 1):
+        candidate = np.asarray(phi(h_prev), dtype=np.float64)
+        residual_vec = candidate - h_prev
+        residual = float(np.linalg.norm(residual_vec))
+        final_residual = residual
+        if use_anderson:
+            history_states.append(candidate.copy())
+            history_residuals.append(residual_vec.copy())
+            h_next = _anderson_mix(h_prev, list(history_states), list(history_residuals), beta_mix, 1.0)
+        else:
+            h_next = candidate
+        ratio_trigger = False
+        if prev_residual is not None and prev_residual > 0.0:
+            ratio = residual / max(prev_residual, 1e-12)
+            ratio_trigger = ratio > 0.98
+        if residual <= tol or ratio_trigger:
+            h_prev = h_next
+            effective_k = iteration
+            break
+        h_prev = h_next
+        prev_residual = residual
+        effective_k = iteration
+    return h_prev.astype(np.float64, copy=False), effective_k, float(final_residual)
 
 
 def fixed_point_parallel_solve(

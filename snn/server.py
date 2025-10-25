@@ -1605,6 +1605,7 @@ class TrainingService:
                         "rate_target": rate_target,
                         "residual": residual_value,
                         "k": actual_iters,
+                        "k_eff": actual_iters,
                         "max_k": epoch_k_limit,
                         "k_bin": epoch_bin,
                         "examples": int(batch_x.shape[0]),
@@ -1613,6 +1614,7 @@ class TrainingService:
                     iter_payload = {
                         "epoch": epoch,
                         "step": step + 1,
+                        "k_eff": actual_iters,
                         "k": actual_iters,
                         "max_k": epoch_k_limit,
                         "layer": step % layers_count,
