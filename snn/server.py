@@ -1417,12 +1417,8 @@ class TrainingService:
                         grad_logits_scaled[np.arange(batch_y.shape[0]), batch_y] -= 1.0
                     grad_logits_scaled /= max(batch_y.shape[0], 1)
                     grad_logits = grad_logits_scaled * scale_factor
-                    probs_safe = np.clip(probs, 1e-12, 1.0)
-                    entropy = (
-                        float(np.mean(-np.sum(probs_safe * np.log(probs_safe), axis=1))) if probs.size else 0.0
-                    )
-                    confidence = (
-                        float(np.mean(probs[np.arange(batch_y.shape[0]), batch_y])) if batch_y.size else 0.0
+                    batch_acc, top5_acc, confidence, entropy, predictions = self._classification_metrics(
+                        probs, batch_y
                     )
                     logit_mean = float(np.mean(logits)) if logits.size else 0.0
                     logit_std = float(np.std(logits)) if logits.size else 0.0
@@ -1430,12 +1426,20 @@ class TrainingService:
                     if logit_scale_learnable:
                         inv_temp = 1.0 / temperature
                         logit_scale_grad = float(np.sum(grad_logits_scaled * logits_source) * inv_temp)
-                    predictions = np.argmax(probs, axis=1)
-                    if predictions.shape != batch_y.shape:
-                        raise AssertionError("np.argmax must operate along axis=1")
-                    batch_acc = float(np.mean(predictions == batch_y))
-                    top5_hits = np.any(np.argsort(probs, axis=1)[:, -5:] == batch_y[:, None], axis=1)
-                    top5_acc = float(np.mean(top5_hits))
+                    if step == 0:
+                        await self._emit_log(
+                            "INFO",
+                            (
+                                f"[batch_sanity] epoch={epoch} logit_std={logit_std:.4f} "
+                                f"conf={confidence:.4f} entropy={entropy:.4f}"
+                            ),
+                            metric={
+                                "epoch": epoch,
+                                "logit_std": logit_std,
+                                "confidence": confidence,
+                                "entropy": entropy,
+                            },
+                        )
     
                     if batch_size_actual > 0:
                         epoch_loss_total += loss * batch_size_actual
@@ -1906,27 +1910,57 @@ class TrainingService:
         return logits.astype(np.float32, copy=False), basal_currents.astype(np.float32, copy=False)
 
     @staticmethod
-    def _nll_from_logits(
-        logits: np.ndarray,
-        labels: np.ndarray,
-    ) -> Tuple[float, np.ndarray]:
+    def _nll_from_logits(logits: np.ndarray, labels: np.ndarray) -> Tuple[float, np.ndarray]:
         if logits.ndim != 2:
             raise ValueError("logits tensor must be 2D (batch, classes)")
         if labels.dtype != np.int64:
             raise TypeError(f"labels must be int64 for indexing, got {labels.dtype}")
-        logits64 = logits.astype(np.float64, copy=False)
-        max_logits = np.max(logits64, axis=1, keepdims=True)
-        shifted = logits64 - max_logits
+        shifted = logits - np.max(logits, axis=1, keepdims=True)
         exp_shifted = np.exp(shifted, dtype=np.float64)
         denom = np.clip(np.sum(exp_shifted, axis=1, keepdims=True), 1e-12, None)
         log_probs = shifted - np.log(denom)
-        probs = np.exp(log_probs).astype(logits.dtype, copy=False)
+        probs = np.exp(log_probs).astype(np.float32, copy=False)
         if labels.size == 0:
-            return 0.0, probs
+            return 0.0, probs.astype(logits.dtype, copy=False)
         row_idx = np.arange(labels.shape[0])
         log_prob_true = log_probs[row_idx, labels]
-        loss = float(-np.mean(log_prob_true)) if log_prob_true.size else 0.0
-        return loss, probs
+        nll = float(-np.mean(log_prob_true)) if log_prob_true.size else 0.0
+        return nll, probs.astype(logits.dtype, copy=False)
+
+    @staticmethod
+    def _topk_accuracy(probs: np.ndarray, labels: np.ndarray, k: int) -> float:
+        if probs.shape[0] == 0 or labels.size == 0 or k <= 0:
+            return 0.0
+        k = min(k, probs.shape[1])
+        partition = np.argpartition(-probs, k - 1, axis=1)[:, :k]
+        hits = np.any(partition == labels[:, None], axis=1)
+        return float(np.mean(hits))
+
+    def _classification_metrics(
+        self,
+        probs: np.ndarray,
+        labels: np.ndarray,
+    ) -> Tuple[float, float, float, float, np.ndarray]:
+        if probs.ndim != 2:
+            raise ValueError("probabilities tensor must be 2D")
+        if labels.dtype != np.int64:
+            raise TypeError(f"labels must be int64, got {labels.dtype}")
+        if labels.shape[0] != probs.shape[0]:
+            raise ValueError("labels batch dimension must match probabilities")
+        if labels.size == 0:
+            return 0.0, 0.0, 0.0, 0.0, np.empty(0, dtype=np.int64)
+        sums = np.sum(probs, axis=1)
+        if not np.allclose(sums, 1.0, atol=1e-4):
+            raise AssertionError("probabilities must sum to 1 along classes (±1e-4)")
+        preds = np.argmax(probs, axis=1)
+        if preds.shape != labels.shape:
+            raise AssertionError("predictions shape must match labels")
+        top1 = float(np.mean(preds == labels))
+        top5 = self._topk_accuracy(probs, labels, k=min(5, probs.shape[1]))
+        confidence = float(np.mean(probs[np.arange(labels.shape[0]), labels]))
+        probs_safe = np.clip(probs, 1e-12, 1.0)
+        entropy = float(np.mean(-np.sum(probs_safe * np.log(probs_safe), axis=1)))
+        return top1, top5, confidence, entropy, preds
 
     def _compute_gradients(
         self,
@@ -2099,19 +2133,11 @@ class TrainingService:
                 batch_s_rate = float(np.mean(s_mean)) if s_mean.size else 0.0
             logits = logits_source * (model.logit_scale / temperature)
             loss, probs = self._nll_from_logits(logits, batch_y)
-            pred = np.argmax(probs, axis=1)
-            losses.append(loss)
-            accs.append(float(np.mean(pred == batch_y)))
-            top5_hits = np.any(np.argsort(probs, axis=1)[:, -5:] == batch_y[:, None], axis=1)
-            top5_list.append(float(np.mean(top5_hits)))
             batch_size_actual = batch_x.shape[0]
-            probs_safe = np.clip(probs, 1e-12, 1.0)
-            entropy = (
-                float(np.mean(-np.sum(probs_safe * np.log(probs_safe), axis=1))) if probs.size else 0.0
-            )
-            confidence = (
-                float(np.mean(probs[np.arange(batch_y.shape[0]), batch_y])) if batch_y.size else 0.0
-            )
+            losses.append(loss)
+            batch_acc, top5_acc, confidence, entropy, _ = self._classification_metrics(probs, batch_y)
+            accs.append(batch_acc)
+            top5_list.append(top5_acc)
             conf_sum += confidence * batch_size_actual
             entropy_sum += entropy * batch_size_actual
             logit_sum += float(np.sum(logits))
