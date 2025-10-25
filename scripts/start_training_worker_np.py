@@ -29,6 +29,8 @@ import yaml
 from nats.aio.client import Client as NATS
 from nats.errors import Error as NatsError
 
+from snn.models import ReadoutMLP
+
 from snn.data import DATASET_IMAGE_SHAPES, ensure_feature_stats, standardize_batch
 
 
@@ -74,6 +76,10 @@ class HyperParams:
     anderson_beta: float = 0.5
     K_schedule: Optional[str] = None
     logit_scale: float = 1.0
+    logit_scale_init: float = 1.25
+    logit_scale_min: float = 0.5
+    logit_scale_max: float = 3.0
+    logit_scale_learnable: bool = True
     rate_reg_lambda: float = 1e-3
     rate_target: float = 0.2
     g_apical_start: float = 0.5
@@ -86,6 +92,9 @@ class HyperParams:
     contraction_lambda: float = 0.0
     fp_tolerance: float = 1e-5
     augment: bool = True
+    head_hidden: int = 64
+    head_momentum: float = 0.9
+    unfreeze_at_conf: float = 0.13
 
 
 @dataclass(frozen=True)
@@ -233,6 +242,15 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         logit_scale_value = float(logit_raw.get("value", 1.0))
     else:
         logit_scale_value = float(logit_raw)
+    logit_scale_init_value = float(hyper_raw.get("logit_scale_init", logit_scale_value))
+    logit_scale_min_value = float(hyper_raw.get("logit_scale_min", 0.5))
+    logit_scale_max_value = float(hyper_raw.get("logit_scale_max", 3.0))
+    if logit_scale_max_value <= logit_scale_min_value:
+        logit_scale_max_value = logit_scale_min_value + 1e-5
+    logit_scale_learnable = bool(hyper_raw.get("logit_scale_learnable", True))
+    head_hidden_value = int(max(4, hyper_raw.get("head_hidden", 64)))
+    head_momentum_value = float(np.clip(hyper_raw.get("head_momentum", 0.9), 0.0, 0.999))
+    unfreeze_at_conf_value = float(hyper_raw.get("unfreeze_at_conf", 0.13))
     rate_lambda = float(hyper_raw.get("rate_reg_lambda", 1e-3))
     rate_target = float(hyper_raw.get("rate_target", 0.2))
     reg_block = hyper_raw.get("tstep_regularization")
@@ -303,6 +321,10 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         anderson_beta=anderson_beta_value,
         K_schedule=k_schedule_value,
         logit_scale=max(1e-9, logit_scale_value),
+        logit_scale_init=max(1e-9, logit_scale_init_value),
+        logit_scale_min=max(1e-9, logit_scale_min_value),
+        logit_scale_max=max(logit_scale_max_value, logit_scale_min_value + 1e-5),
+        logit_scale_learnable=logit_scale_learnable,
         rate_reg_lambda=max(0.0, rate_lambda),
         rate_target=rate_target,
         g_apical_start=g_apical_start,
@@ -315,6 +337,9 @@ def resolve_worker_config(raw: Dict[str, Any], override_mode: Optional[str]) -> 
         contraction_lambda=contraction_lambda,
         fp_tolerance=fp_tol_value,
         augment=augment_value,
+        head_hidden=head_hidden_value,
+        head_momentum=head_momentum_value,
+        unfreeze_at_conf=max(0.0, unfreeze_at_conf_value),
     )
 
     nats_raw = worker_raw.get("nats", {})
@@ -784,7 +809,15 @@ class NatsPublisher:
 class ThreeCompartmentModel:
     """Vectorized three-compartment recurrent layer with linear dynamics."""
 
-    def __init__(self, network: NetworkConfig, neuron: NeuronDynamics, rng: np.random.Generator) -> None:
+    def __init__(
+        self,
+        network: NetworkConfig,
+        neuron: NeuronDynamics,
+        rng: np.random.Generator,
+        *,
+        head_hidden: int,
+        head_momentum: float,
+    ) -> None:
         hidden = network.hidden_dim
         scale_in = 1.0 / np.sqrt(network.input_dim)
         scale_rec = 1.0 / np.sqrt(hidden)
@@ -792,8 +825,7 @@ class ThreeCompartmentModel:
         self.Wxh = rng.standard_normal((hidden, network.input_dim)) * scale_in
         self.Whh = rng.standard_normal((hidden, hidden)) * scale_rec
         self.bh = np.zeros(hidden, dtype=np.float64)
-        self.Wo = rng.standard_normal((network.output_dim, hidden)) * (1.0 / np.sqrt(hidden))
-        self.bo = np.zeros(network.output_dim, dtype=np.float64)
+        self.head = ReadoutMLP(hidden, head_hidden, network.output_dim, rng, momentum=head_momentum)
 
         self.network = network
         self.neuron = neuron
@@ -854,8 +886,7 @@ class ThreeCompartmentModel:
             h_list.append(h.copy())
             basal_list.append(basal.copy())
             apical_list.append(apical.copy())
-        logits = h @ self.Wo.T + self.bo
-        return logits, h_list, basal_list, apical_list, spikes
+        return h.copy(), h_list, basal_list, apical_list, spikes
 
 # ---------------------------------------------------------------------------
 # Training routines
@@ -905,13 +936,23 @@ class Trainer:
         self.rate_target = float(self.cfg.hyper.rate_target)
         self.g_apical_start = float(self.cfg.hyper.g_apical_start)
         self.g_apical_end = float(self.cfg.hyper.g_apical_end)
-        self.logit_scale = float(self.cfg.hyper.logit_scale)
+        init_scale = (
+            self.cfg.hyper.logit_scale_init
+            if self.cfg.hyper.logit_scale_init is not None
+            else self.cfg.hyper.logit_scale
+        )
+        self.logit_scale = float(max(1e-9, init_scale))
+        self.logit_scale_min = float(max(1e-9, self.cfg.hyper.logit_scale_min))
+        self.logit_scale_max = float(max(self.logit_scale_min + 1e-5, self.cfg.hyper.logit_scale_max))
+        self.logit_scale_learnable = bool(self.cfg.hyper.logit_scale_learnable)
         self.beta_start = self.cfg.hyper.beta_start
         self.beta_end = self.cfg.hyper.beta_end
         self.v_th_start = self.cfg.hyper.v_th_start
         self.v_th_end = self.cfg.hyper.v_th_end
         self.contraction_rho = float(self.cfg.hyper.contraction_rho)
         self.contraction_lambda = max(0.0, float(self.cfg.hyper.contraction_lambda))
+        self.unfreeze_threshold = float(max(0.0, self.cfg.hyper.unfreeze_at_conf))
+        self._backbone_frozen = self.unfreeze_threshold > 0.0 and self.cfg.mode == "fpt"
         self._base_beta = self.model.neuron.beta
         self._base_threshold = self.model.neuron.threshold
         self._spectral_rng = np.random.default_rng(self.cfg.hyper.seed)
@@ -1016,11 +1057,6 @@ class Trainer:
         soma_stack = np.stack(h_list[1:], axis=0)
         return np.mean(soma_stack, axis=0)
 
-    def _scale_output_features(self, features: np.ndarray) -> np.ndarray:
-        if self.logit_scale == 1.0:
-            return features
-        return features * self.logit_scale
-
     def _truth_probe(
         self,
         logits: np.ndarray,
@@ -1117,10 +1153,10 @@ class Trainer:
         )
         features = self._mean_soma_states(h_list)
         s_rate = float(np.mean(features)) if features.size else 0.0
-        scaled_features = self._scale_output_features(features)
-        pre_logits = scaled_features @ self.model.Wo.T + self.model.bo
         temp_value = self.temperature
-        logits = pre_logits / temp_value
+        head_outputs, head_cache = self.model.head.forward(features, return_cache=True)
+        scale_factor = self.logit_scale / temp_value
+        logits = head_outputs * scale_factor
         if logits.ndim != 2 or logits.shape[1] != num_classes:
             raise ValueError(f"logits must be (batch,{num_classes}), got {logits.shape}")
 
@@ -1147,32 +1183,35 @@ class Trainer:
             rate_error = s_rate - self.rate_target
             loss += self.rate_reg_lambda * (rate_error ** 2)
 
-        grad_logits = probs.copy()
+        grad_logits_scaled = probs.copy()
         if batch_y.size:
-            grad_logits[np.arange(batch_y.shape[0]), batch_y] -= 1.0
-        grad_logits /= max(batch_y.shape[0], 1)
-
-        grad_pre = grad_logits / temp_value
-        grad_Wo = grad_pre.T @ scaled_features
-        grad_bo = np.sum(grad_pre, axis=0)
-        temp_grad_arr = None
+            grad_logits_scaled[np.arange(batch_y.shape[0]), batch_y] -= 1.0
+        grad_logits_scaled /= max(batch_y.shape[0], 1)
+        grad_head_logits = grad_logits_scaled * scale_factor
+        _, head_grads = self.model.head.backward(grad_head_logits, head_cache)
+        common_term = float(np.sum(grad_logits_scaled * head_outputs))
+        temp_grad_arr: Optional[np.ndarray] = None
         if self.learnable_temperature:
-            temp_grad = -np.sum(grad_logits * pre_logits) / (temp_value ** 2)
+            temp_grad = -common_term * self.logit_scale / (temp_value ** 2)
             temp_grad_arr = np.array([temp_grad], dtype=np.float64)
-        grads = [grad_Wo, grad_bo]
+        grads_to_clip = [
+            head_grads["W1"],
+            head_grads["b1"],
+            head_grads["W2"],
+            head_grads["b2"],
+        ]
         if temp_grad_arr is not None:
-            grads.append(temp_grad_arr)
-        _clip_gradient_norm(grads, self.grad_clip)
-        if temp_grad_arr is not None:
-            temp_update = float(temp_grad_arr[0])
+            grads_to_clip.append(temp_grad_arr)
+        _clip_gradient_norm(grads_to_clip, self.grad_clip)
+        self.model.head.apply_gradients(head_grads, lr, weight_decay=self.weight_decay)
+        if self.logit_scale_learnable:
+            logit_scale_grad = common_term / temp_value
+            updated_scale = self.logit_scale - lr * logit_scale_grad
+            self.logit_scale = float(np.clip(updated_scale, self.logit_scale_min, self.logit_scale_max))
         else:
-            temp_update = None
-
-        _apply_decoupled_weight_decay(self.model.Wo, lr, self.weight_decay)
-        self.model.Wo -= lr * grad_Wo
-        self.model.bo -= lr * grad_bo
-        if temp_update is not None:
-            self._temperature = max(1e-6, self._temperature - lr * temp_update)
+            self.logit_scale = float(np.clip(self.logit_scale, self.logit_scale_min, self.logit_scale_max))
+        if temp_grad_arr is not None:
+            self._temperature = max(1e-6, self._temperature - lr * float(temp_grad_arr[0]))
 
         total_spikes, per_neuron = _aggregate_spikes(spikes)
         return TrainStepResult(
@@ -1213,9 +1252,10 @@ class Trainer:
         s_rate = float(np.mean(s_mean)) if s_mean.size else 0.0
         temp_value = self.temperature
         final_state = h_list[-1]
-        scaled_state = self._scale_output_features(final_state)
-        pre_logits = scaled_state @ self.model.Wo.T + self.model.bo
-        logits = pre_logits / temp_value
+        head_inputs = final_state
+        head_outputs, head_cache = self.model.head.forward(head_inputs, return_cache=True)
+        scale_factor = self.logit_scale / temp_value
+        logits = head_outputs * scale_factor
         assert logits.shape[1] == num_classes, "logit dimension mismatch"
 
         nll, probs = nll_from_logits(logits, batch_y, num_classes=num_classes)
@@ -1230,14 +1270,24 @@ class Trainer:
             s_rate=s_rate,
         )
         loss = nll
+        contraction_lambda = self.contraction_lambda if self.cfg.mode == "fpt" else 0.0
+        if contraction_lambda > 0.0:
+            loss += contraction_lambda * float(np.sum(self.model.Whh ** 2))
         if self.rate_reg_lambda > 0.0:
             rate_error = s_rate - self.rate_target
             loss += self.rate_reg_lambda * (rate_error ** 2)
 
-        grad_logits = probs.copy()
+        grad_logits_scaled = probs.copy()
         if batch_y.size:
-            grad_logits[np.arange(batch_y.shape[0]), batch_y] -= 1.0
-        grad_logits /= max(batch_y.shape[0], 1)
+            grad_logits_scaled[np.arange(batch_y.shape[0]), batch_y] -= 1.0
+        grad_logits_scaled /= max(batch_y.shape[0], 1)
+        grad_head_logits = grad_logits_scaled * scale_factor
+        grad_head_inputs, head_grads = self.model.head.backward(grad_head_logits, head_cache)
+        common_term = float(np.sum(grad_logits_scaled * head_outputs))
+        temp_grad_arr: Optional[np.ndarray] = None
+        if self.learnable_temperature:
+            temp_grad = -common_term * self.logit_scale / (temp_value ** 2)
+            temp_grad_arr = np.array([temp_grad], dtype=np.float64)
 
         neuron = self.cfg.neuron
         beta_value = (
@@ -1245,15 +1295,15 @@ class Trainer:
             if beta_override is not None
             else neuron.beta
         )
-        max_steps = max(1, self._active_truncation)
         solver = self.solver
+        max_steps = max(1, self._active_truncation)
         anderson_depth = max(1, self.anderson_m)
         anderson_beta = np.clip(self.anderson_beta, 0.0, 1.0)
         h_current = h_list[-1].copy()
         h_prev = h_list[-2].copy()
         residual_value = float(np.linalg.norm(h_current - h_prev) / np.sqrt(h_current.size))
         iteration_used = 1
-        if solver == "anderson":
+        if solver == "anderson" and not self._backbone_frozen:
             diffs: List[np.ndarray] = []
             residuals: List[np.ndarray] = []
             for iteration in range(1, max_steps + 1):
@@ -1264,31 +1314,7 @@ class Trainer:
                         iteration_used = iteration
                         break
                 h_prev = h_current.copy()
-                # compute next h via plain update
-                grad_tmp = grad_logits / temp_value
-                grad_h = (grad_tmp @ self.model.Wo) * self.logit_scale
-                grad_basal = np.zeros_like(grad_h)
-                grad_apical = np.zeros_like(grad_h)
-                grad_Wxh = np.zeros_like(self.model.Wxh)
-                grad_Whh = np.zeros_like(self.model.Whh)
-                grad_bh = np.zeros_like(self.model.bh)
-                alpha = neuron.alpha
-                beta = beta_value
-                gamma = neuron.gamma
-                timesteps = batch_x.shape[1]
-                for idx in range(timesteps - 1, -1, -1):
-                    x_t = batch_x[:, idx, :]
-                    h_prev_step = h_list[idx]
-                    grad_basal += alpha * neuron.coupling_basal * grad_h
-                    grad_apical += alpha * neuron.coupling_apical * grad_h
-                    grad_z = alpha * grad_h + beta * grad_basal
-                    grad_Wxh += grad_z.T @ x_t
-                    grad_Whh += grad_z.T @ h_prev_step
-                    grad_bh += np.sum(grad_z, axis=0)
-                    grad_h_prev = (1.0 - alpha) * grad_h + gamma * grad_apical + grad_z @ self.model.Whh
-                    grad_basal = (1.0 - beta) * grad_basal
-                    grad_apical = (1.0 - gamma) * grad_apical
-                    grad_h = grad_h_prev
+                grad_h = grad_head_inputs.copy()
                 plain_update = h_prev - lr * grad_h
                 residual_vector = plain_update - h_prev
                 diffs.append(plain_update.reshape(plain_update.shape[0], -1))
@@ -1309,93 +1335,103 @@ class Trainer:
                 iteration_used = iteration
         truncation = max_steps
 
-        grad_pre = grad_logits / temp_value
-        grad_Wo = grad_pre.T @ scaled_state
-        grad_bo = np.sum(grad_pre, axis=0)
-
-        grad_h = (grad_pre @ self.model.Wo) * self.logit_scale
-        grad_basal = np.zeros_like(grad_h)
-        grad_apical = np.zeros_like(grad_h)
-
-        grad_Wxh = np.zeros_like(self.model.Wxh)
-        grad_Whh = np.zeros_like(self.model.Whh)
-        grad_bh = np.zeros_like(self.model.bh)
-
-        alpha = neuron.alpha
-        beta = beta_value
-        gamma = neuron.gamma
-
-        timesteps = batch_x.shape[1]
-        steps = 0
-        residual_accum = 0.0
-        residual_count = 0
-        prev_step_residual: Optional[float] = None
-        for idx in range(timesteps - 1, -1, -1):
-            x_t = batch_x[:, idx, :]
-            h_prev = h_list[idx]
-
-            grad_basal += alpha * neuron.coupling_basal * grad_h
-            grad_apical += alpha * neuron.coupling_apical * grad_h
-            grad_z = alpha * grad_h + beta * grad_basal
-
-            grad_Wxh += grad_z.T @ x_t
-            grad_Whh += grad_z.T @ h_prev
-            grad_bh += np.sum(grad_z, axis=0)
-
-            grad_h_prev = (1.0 - alpha) * grad_h + gamma * grad_apical + grad_z @ self.model.Whh
-
-            grad_basal = (1.0 - beta) * grad_basal
-            grad_apical = (1.0 - gamma) * grad_apical
-            grad_h = grad_h_prev
-
-            if idx > 0:
-                delta = np.abs(h_list[idx] - h_list[idx - 1])
-                step_residual = float(np.mean(delta))
-                residual_accum += step_residual
-                residual_count += 1
-                stop_due_to_tol = self.fp_tolerance > 0.0 and step_residual <= self.fp_tolerance
-                ratio_trigger = (
-                    prev_step_residual is not None
-                    and prev_step_residual > 0.0
-                    and (step_residual / max(prev_step_residual, 1e-9)) > 0.98
-                )
-                prev_step_residual = step_residual
-            else:
-                stop_due_to_tol = False
-                ratio_trigger = False
-
-            steps += 1
-            if steps >= truncation or stop_due_to_tol or ratio_trigger:
-                break
-
-        residual_value = residual_accum / residual_count if residual_count > 0 else 0.0
-        iteration_used = steps
-        if contraction_lambda > 0.0:
-            grad_Whh += 2.0 * contraction_lambda * self.model.Whh
-
-        temp_grad_arr = None
-        if self.learnable_temperature:
-            temp_grad = -np.sum(grad_logits * pre_logits) / (temp_value ** 2)
-            temp_grad_arr = np.array([temp_grad], dtype=np.float64)
-        grads = [grad_Wo, grad_bo, grad_Wxh, grad_Whh, grad_bh]
-        if temp_grad_arr is not None:
-            grads.append(temp_grad_arr)
-        _clip_gradient_norm(grads, self.grad_clip)
-        if temp_grad_arr is not None:
-            temp_update = float(temp_grad_arr[0])
+        grads_to_clip = [
+            head_grads["W1"],
+            head_grads["b1"],
+            head_grads["W2"],
+            head_grads["b2"],
+        ]
+        backbone_requires_update = not self._backbone_frozen
+        grad_Wxh: Optional[np.ndarray]
+        grad_Whh: Optional[np.ndarray]
+        grad_bh: Optional[np.ndarray]
+        if backbone_requires_update:
+            grad_h = grad_head_inputs.copy()
+            grad_basal = np.zeros_like(grad_h)
+            grad_apical = np.zeros_like(grad_h)
+            grad_Wxh = np.zeros_like(self.model.Wxh)
+            grad_Whh = np.zeros_like(self.model.Whh)
+            grad_bh = np.zeros_like(self.model.bh)
+            alpha = neuron.alpha
+            beta = beta_value
+            gamma = neuron.gamma
+            timesteps = batch_x.shape[1]
+            steps = 0
+            residual_accum = 0.0
+            residual_count = 0
+            prev_step_residual: Optional[float] = None
+            for idx in range(timesteps - 1, -1, -1):
+                x_t = batch_x[:, idx, :]
+                h_prev_step = h_list[idx]
+                grad_basal += alpha * neuron.coupling_basal * grad_h
+                grad_apical += alpha * neuron.coupling_apical * grad_h
+                grad_z = alpha * grad_h + beta * grad_basal
+                grad_Wxh += grad_z.T @ x_t
+                grad_Whh += grad_z.T @ h_prev_step
+                grad_bh += np.sum(grad_z, axis=0)
+                grad_h_prev = (1.0 - alpha) * grad_h + gamma * grad_apical + grad_z @ self.model.Whh
+                grad_basal = (1.0 - beta) * grad_basal
+                grad_apical = (1.0 - gamma) * grad_apical
+                grad_h = grad_h_prev
+                if idx > 0:
+                    delta = np.abs(h_list[idx] - h_list[idx - 1])
+                    step_residual = float(np.mean(delta))
+                    residual_accum += step_residual
+                    residual_count += 1
+                    stop_due_to_tol = self.fp_tolerance > 0.0 and step_residual <= self.fp_tolerance
+                    ratio_trigger = (
+                        prev_step_residual is not None
+                        and prev_step_residual > 0.0
+                        and (step_residual / max(prev_step_residual, 1e-9)) > 0.98
+                    )
+                    prev_step_residual = step_residual
+                else:
+                    stop_due_to_tol = False
+                    ratio_trigger = False
+                steps += 1
+                if steps >= truncation or stop_due_to_tol or ratio_trigger:
+                    break
+            residual_value = residual_accum / residual_count if residual_count > 0 else 0.0
+            iteration_used = steps
+            if contraction_lambda > 0.0:
+                grad_Whh += 2.0 * contraction_lambda * self.model.Whh
+            grads_to_clip.extend([grad_Wxh, grad_Whh, grad_bh])
         else:
-            temp_update = None
+            grad_Wxh = grad_Whh = grad_bh = None
+            residual_value = 0.0
+            iteration_used = 0
 
-        _apply_decoupled_weight_decay(self.model.Wxh, lr, self.weight_decay)
-        _apply_decoupled_weight_decay(self.model.Whh, lr, self.weight_decay)
-        _apply_decoupled_weight_decay(self.model.Wo, lr, self.weight_decay)
-        self.model.Wxh -= lr * grad_Wxh
-        self.model.Whh -= lr * grad_Whh
-        self.model.Wo -= lr * grad_Wo
-        self.model.bh -= lr * grad_bh
-        self.model.bo -= lr * grad_bo
-        if temp_update is not None:
-            self._temperature = max(1e-6, self._temperature - lr * temp_update)
+        if temp_grad_arr is not None:
+            grads_to_clip.append(temp_grad_arr)
+        _clip_gradient_norm(grads_to_clip, self.grad_clip)
+        self.model.head.apply_gradients(head_grads, lr, weight_decay=self.weight_decay)
+        if self.logit_scale_learnable:
+            logit_scale_grad = common_term / temp_value
+            updated_scale = self.logit_scale - lr * logit_scale_grad
+            self.logit_scale = float(np.clip(updated_scale, self.logit_scale_min, self.logit_scale_max))
+        else:
+            self.logit_scale = float(np.clip(self.logit_scale, self.logit_scale_min, self.logit_scale_max))
+        if temp_grad_arr is not None:
+            self._temperature = max(1e-6, self._temperature - lr * float(temp_grad_arr[0]))
+
+        if backbone_requires_update and grad_Wxh is not None and grad_Whh is not None and grad_bh is not None:
+            _apply_decoupled_weight_decay(self.model.Wxh, lr, self.weight_decay)
+            _apply_decoupled_weight_decay(self.model.Whh, lr, self.weight_decay)
+            self.model.Wxh -= lr * grad_Wxh
+            self.model.Whh -= lr * grad_Whh
+            self.model.bh -= lr * grad_bh
+
+        if (
+            self._backbone_frozen
+            and self.unfreeze_threshold > 0.0
+            and confidence >= self.unfreeze_threshold
+        ):
+            self._backbone_frozen = False
+            LOGGER.info(
+                "Backbone unfrozen at confidence=%.4f (threshold=%.4f)",
+                confidence,
+                self.unfreeze_threshold,
+            )
 
         total_spikes, per_neuron = _aggregate_spikes(spikes)
         return TrainStepResult(
@@ -1445,14 +1481,11 @@ class Trainer:
                 threshold_override=threshold_override,
             )
             if self.cfg.mode == "tstep":
-                features = self._mean_soma_states(h_list)
-                scaled_features = self._scale_output_features(features)
-                logits = scaled_features @ self.model.Wo.T + self.model.bo
+                head_inputs = self._mean_soma_states(h_list)
             else:
-                final_state = h_list[-1]
-                scaled_state = self._scale_output_features(final_state)
-                logits = scaled_state @ self.model.Wo.T + self.model.bo
-            logits = logits / temp_value
+                head_inputs = h_list[-1]
+            head_outputs, _ = self.model.head.forward(head_inputs, return_cache=False)
+            logits = head_outputs * (self.logit_scale / temp_value)
             loss, probs = nll_from_logits(logits, batch_y, num_classes=self.model.network.output_dim)
             acc, top5, confidence, entropy = classification_stats(probs, batch_y)
             batch_count = batch_x.shape[0]
@@ -1516,7 +1549,13 @@ class Trainer:
 
 async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = None) -> None:
     rng = np.random.default_rng(worker_cfg.hyper.seed)
-    model = ThreeCompartmentModel(worker_cfg.network, worker_cfg.neuron, rng)
+    model = ThreeCompartmentModel(
+        worker_cfg.network,
+        worker_cfg.neuron,
+        rng,
+        head_hidden=worker_cfg.hyper.head_hidden,
+        head_momentum=worker_cfg.hyper.head_momentum,
+    )
 
     train_x, train_y, val_x, val_y = load_datasets(
         worker_cfg.dataset,
@@ -1685,6 +1724,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                         "entropy": result.entropy,
                         "lr": current_lr,
                         "temperature": trainer.temperature,
+                        "logit_scale": trainer.logit_scale,
                         "mode": worker_cfg.mode,
                         "examples": batch_count,
                         "throughput": throughput,
@@ -1762,6 +1802,7 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 "entropy": val_entropy,
                 "lr": last_lr,
                 "temperature": trainer.temperature,
+                "logit_scale": trainer.logit_scale,
                 "train_loss": train_avg_loss,
                 "train_nll": train_avg_nll,
                 "train_acc": train_avg_acc,

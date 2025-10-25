@@ -43,6 +43,13 @@ training_worker:
     logit_scale:
       value: 1.25
       learnable: false
+    logit_scale_init: 1.25
+    logit_scale_min: 0.5
+    logit_scale_max: 3.0
+    logit_scale_learnable: true
+    head_hidden: 64
+    head_momentum: 0.9
+    unfreeze_at_conf: 0.13
     solver:
       type: anderson
       anderson_m: 4
