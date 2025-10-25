@@ -87,6 +87,7 @@ npm run dev
 - UI 无法连接事件源：检查 NATS 是否启动、后端是否暴露 `/events` SSE；浏览器开发者工具应能看到 `metrics_batch` 等事件。
 - 数据集下拉为空：确认后端实现了 `GET /api/datasets` 并返回符合约定的 JSON。
 - 训练状态未更新：`POST /api/train/start` 应返回 2xx，同时 SSE 中应发送 `train_status` 或 `metrics_batch` 事件。
+- 3D 网络只在第一次脉冲时点亮：确保后端持续推送 `spike` 事件；前端通过 `spikeSequence` 计数（`ui-vue/src/store/ui.ts`）对每次 `pushSpike` 自增，`Network3D` 监听该计数来渲染最新脉冲，即使 `spikes` 数组因裁剪保持恒长也能继续触发高亮。
 
 ## 6) 事件流与数据约定（SSE `/events`）
 

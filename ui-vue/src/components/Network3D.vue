@@ -274,35 +274,64 @@ const rebuildScene = (layouts: LayerLayout[]) => {
 };
 
 const highlightNeurons = (globalIndices: number[]) => {
+  let touched = false;
   globalIndices.forEach((index) => {
     if (index >= 0 && index < glow.length) {
-      glow[index] = Math.max(glow[index], 2.2);
+      glow[index] = 1.2;
+      const offset = index * 3;
+      nodeColors[offset] = highlightNodeColor.r;
+      nodeColors[offset + 1] = highlightNodeColor.g;
+      nodeColors[offset + 2] = highlightNodeColor.b;
+      touched = true;
     }
   });
+  if (touched && nodeColorAttr) {
+    nodeColorAttr.needsUpdate = true;
+  }
 };
 
 const highlightEdges = (edgePairs: Array<[number, number]> | undefined, neurons: number[]) => {
   const touched = new Set<number>();
+  let matched = false;
   if (edgePairs && edgePairs.length > 0) {
     edgePairs.forEach(([src, dst]) => {
       const key = `${src}:${dst}`;
       const edgeIdx = edgeIndexMap.get(key);
       if (edgeIdx !== undefined) {
-        edgeIntensity[edgeIdx] = Math.max(edgeIntensity[edgeIdx] ?? 0, 1.8);
+        edgeIntensity[edgeIdx] = Math.max(edgeIntensity[edgeIdx] ?? 0, 2.2);
+        const base = edgeIdx * 6;
+        edgeColors[base] = highlightEdgeColor.r;
+        edgeColors[base + 1] = highlightEdgeColor.g;
+        edgeColors[base + 2] = highlightEdgeColor.b;
+        edgeColors[base + 3] = highlightEdgeColor.r;
+        edgeColors[base + 4] = highlightEdgeColor.g;
+        edgeColors[base + 5] = highlightEdgeColor.b;
         touched.add(edgeIdx);
+        matched = true;
       }
     });
-  } else {
+  }
+  if (!matched) {
     neurons.forEach((neuron) => {
       const edgesForNeuron = nodeToEdges.get(neuron);
       if (!edgesForNeuron) {
         return;
       }
       edgesForNeuron.forEach((edgeIdx) => {
-        edgeIntensity[edgeIdx] = Math.max(edgeIntensity[edgeIdx] ?? 0, 1.8);
+        edgeIntensity[edgeIdx] = Math.max(edgeIntensity[edgeIdx] ?? 0, 2.0);
+        const base = edgeIdx * 6;
+        edgeColors[base] = highlightEdgeColor.r;
+        edgeColors[base + 1] = highlightEdgeColor.g;
+        edgeColors[base + 2] = highlightEdgeColor.b;
+        edgeColors[base + 3] = highlightEdgeColor.r;
+        edgeColors[base + 4] = highlightEdgeColor.g;
+        edgeColors[base + 5] = highlightEdgeColor.b;
         touched.add(edgeIdx);
       });
     });
+  }
+  if (touched.size > 0 && edgeColorAttr) {
+    edgeColorAttr.needsUpdate = true;
   }
   return touched;
 };
@@ -358,8 +387,8 @@ const animate = () => {
     return;
   }
   const delta = clock.getDelta();
-  const glowDecay = delta * 0.8;
-  const edgeDecay = delta * 0.7;
+  const glowDecay = delta * 0.9;
+  const edgeDecay = delta * 0.75;
   let colorDirty = false;
 
   if (glow.length && nodeMesh && nodeColorAttr) {
@@ -494,13 +523,12 @@ watch(
 );
 
 watch(
-  () => store.spikes.length,
-  (length) => {
-    if (!length) {
-      return;
+  () => store.spikeSequence,
+  () => {
+    const spike = store.spikes[store.spikes.length - 1];
+    if (spike) {
+      processSpike(spike);
     }
-    const spike = store.spikes[length - 1];
-    processSpike(spike);
   }
 );
 </script>

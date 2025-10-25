@@ -129,7 +129,8 @@ export const useUiStore = defineStore('ui', {
       pulseLayerCursor: 0,
       lastPulseAt: null as number | null,
       spikeStreamActive: false,
-      lastSpikeEventAt: null as number | null
+      lastSpikeEventAt: null as number | null,
+      spikeSequence: 0
     };
   },
   getters: {
@@ -352,6 +353,7 @@ export const useUiStore = defineStore('ui', {
         this.spikeStreamActive = true;
         this.lastSpikeEventAt = now;
       }
+      this.spikeSequence += 1;
     },
     triggerPulseFromIter(payload: TrainIterEvent) {
       const now = Date.now();
