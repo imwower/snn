@@ -975,6 +975,8 @@ class TrainStepResult:
     delta_norm: Optional[float] = None
     lr_head: Optional[float] = None
     lr_rec: Optional[float] = None
+    active_neurons: Optional[List[int]] = None
+    active_edges: Optional[List[Tuple[int, int]]] = None
 
 
 class Trainer:
@@ -1056,6 +1058,14 @@ class Trainer:
     @property
     def temperature(self) -> float:
         return float(self._temperature)
+
+    @property
+    def base_beta(self) -> float:
+        return float(self._base_beta)
+
+    @property
+    def base_threshold(self) -> float:
+        return float(self._base_threshold)
 
     def _forward_batch(
         self,
@@ -1180,6 +1190,23 @@ class Trainer:
         ):
             raise AssertionError("probabilities outside [0,1] or non-finite")
         return logit_mean, logit_std
+
+    @staticmethod
+    def _active_neuron_summary(features: np.ndarray, limit: int = 8) -> Tuple[List[int], List[Tuple[int, int]]]:
+        if features.size == 0:
+            return [], []
+        activity = np.mean(features, axis=0)
+        if activity.ndim == 0:
+            return [0], []
+        top_k = min(limit, activity.shape[0])
+        if top_k <= 0:
+            return [], []
+        order = np.argsort(-activity)[:top_k]
+        neurons = [int(idx) for idx in order]
+        edges: List[Tuple[int, int]] = []
+        for i in range(len(neurons) - 1):
+            edges.append((neurons[i], neurons[i + 1]))
+        return neurons, edges
 
     def _apply_optimizer(
         self,
@@ -1345,6 +1372,7 @@ class Trainer:
         )
 
         total_spikes, per_neuron = _aggregate_spikes(spikes)
+        active_neurons, active_edges = self._active_neuron_summary(features)
         return TrainStepResult(
             loss=loss,
             nll=nll,
@@ -1361,6 +1389,8 @@ class Trainer:
             delta_norm=delta_norm,
             lr_head=head_lr,
             lr_rec=rec_lr,
+            active_neurons=active_neurons or None,
+            active_edges=active_edges or None,
         )
 
     def _train_step_fpt(
@@ -1586,6 +1616,8 @@ class Trainer:
             delta_norm=delta_norm,
             lr_head=head_lr,
             lr_rec=rec_lr,
+            active_neurons=None,
+            active_edges=None,
         )
 
     def evaluate(
@@ -1781,6 +1813,8 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
             epoch_logit_count = 0
             progress = 1.0 if epochs <= 1 else epoch / max(1, epochs - 1)
             g_apical_value, beta_override, threshold_override = trainer.resolve_annealed_params(progress)
+            beta_effective = float(beta_override if beta_override is not None else trainer.base_beta)
+            v_th_effective = float(threshold_override if threshold_override is not None else trainer.base_threshold)
             if worker_cfg.mode == "fpt":
                 trainer.refresh_truncation(epoch, epochs)
             batch_iter = _iter_epoch_batches(total_examples, worker_cfg.hyper.batch_size, data_rng)
@@ -1867,10 +1901,22 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                     epoch_rate_sum += float(result.s_rate) * batch_count
                     epoch_rate_count += batch_count
 
-                if global_step % 10 == 0:
-                    metrics_payload: Dict[str, Any] = {
-                        "phase": "train",
-                        "epoch": epoch + 1,
+                    if global_step % 10 == 0:
+                        if worker_cfg.mode == "tstep" and result.active_neurons:
+                            spike_visual_payload = {
+                                "epoch": epoch + 1,
+                                "step": global_step,
+                                "mode": worker_cfg.mode,
+                                "layer": 1,
+                                "neurons": result.active_neurons,
+                                "edges": [list(edge) for edge in (result.active_edges or [])],
+                                "time_unix": current_millis(),
+                            }
+                            spike_subject_visual = f"{worker_cfg.nats.subjects.spikes}.1"
+                            await publisher.publish_json(spike_subject_visual, spike_visual_payload)
+                        metrics_payload: Dict[str, Any] = {
+                            "phase": "train",
+                            "epoch": epoch + 1,
                         "step": global_step,
                         "loss": result.loss,
                         "nll": result.nll,
@@ -2003,6 +2049,10 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
             metrics_payload["logit_mean"] = val_logit_mean
             metrics_payload["logit_std"] = val_logit_std
             metrics_payload["rate_target"] = trainer.rate_target
+            metrics_payload["train_rate"] = train_avg_rate
+            metrics_payload["g_apical"] = g_apical_value
+            metrics_payload["beta"] = beta_effective
+            metrics_payload["v_th"] = v_th_effective
             await publisher.publish_json(worker_cfg.nats.subjects.metrics, metrics_payload)
 
             log_metric = {
@@ -2028,6 +2078,10 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                 log_metric["avg_throughput"] = avg_throughput
             if residual_mean is not None:
                 log_metric["residual"] = residual_mean
+            log_metric["g_apical"] = g_apical_value
+            log_metric["beta"] = beta_effective
+            log_metric["v_th"] = v_th_effective
+            log_metric["train_rate"] = train_avg_rate
             log_metric["lr_head"] = last_head_lr
             log_metric["lr_rec"] = last_rec_lr
             log_payload = {
@@ -2036,7 +2090,8 @@ async def run_worker(worker_cfg: WorkerConfig, override_epochs: Optional[int] = 
                     f"[epoch {epoch + 1}/{epochs}] mode={worker_cfg.mode} "
                     f"train_loss={train_avg_loss:.4f} train_acc={train_avg_acc:.4f} train_top5={train_avg_top5:.4f} "
                     f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_top5={val_top5:.4f} "
-                    f"conf={val_conf:.4f} entropy={val_entropy:.4f} rate={train_avg_rate:.3f}→target={trainer.rate_target:.2f}"
+                    f"conf={val_conf:.4f} entropy={val_entropy:.4f} rate={train_avg_rate:.3f}→target={trainer.rate_target:.2f} "
+                    f"g_apical={g_apical_value:.3f} beta={beta_effective:.3f} v_th={v_th_effective:.3f}"
                     + (f" residual={residual_mean:.6f}" if residual_mean is not None else "")
                     + (f" avg_throughput={avg_throughput:.2f}" if avg_throughput is not None else "")
                 ),
