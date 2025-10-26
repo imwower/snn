@@ -587,6 +587,8 @@ export const useUiStore = defineStore('ui', {
         this.pushPlainLog(`数据集 ${datasetName} 下载完成`, 'INFO');
       } else {
         this.pushPlainLog(`数据集 ${datasetName} 下载失败${message ? `：${message}` : ''}`, 'ERROR');
+        const detail = message ? `：${message}` : '';
+        this.showToast(`数据集 ${datasetName} 下载失败${detail}`, 'error', 4000);
       }
       this.pushMessage('dataset', { name: datasetName, success, message }, 'dataset_download');
     },
