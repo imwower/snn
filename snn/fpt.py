@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Deque, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -29,6 +29,9 @@ class FixedPointConfig:
     solver: str = "plain"
     anderson_m: int = 4
     anderson_beta: float = 0.5
+    anderson_ridge: float = 1e-4
+    line_search: bool = True
+    fp_err_guard: float = 5.0
 
 
 @dataclass
@@ -37,6 +40,10 @@ class FixedPointResult:
 
     states: List[CompartmentState]
     residuals: List[float]
+    iter_errors: List[float] = field(default_factory=list)
+    effective_iterations: int = 0
+    final_fp_error: float = 0.0
+    final_iter_error: float = 0.0
 
 
 def _to_list(seq: Sequence[float], *, name: str) -> List[float]:
@@ -53,38 +60,74 @@ def _initial_vector(length: int, value: float) -> List[float]:
     return [float(value) for _ in range(length)]
 
 
-def _apply_damped_update(prev: np.ndarray, candidate: np.ndarray, damping: float) -> np.ndarray:
-    return (1.0 - damping) * prev + damping * candidate
+def _stack_state(soma: np.ndarray, apical: np.ndarray, basal: np.ndarray) -> np.ndarray:
+    return np.stack([soma, apical, basal], axis=0)
 
 
-def _anderson_mix(
-    prev: np.ndarray,
-    state_history: Sequence[np.ndarray],
-    residual_history: Sequence[np.ndarray],
-    beta: float,
-    damping: float,
-) -> np.ndarray:
-    if len(state_history) < 2:
-        return _apply_damped_update(prev, state_history[-1], damping)
-    stacked_res = np.stack(residual_history, axis=1)  # (dim, m)
-    m = stacked_res.shape[1]
-    gram = stacked_res.T @ stacked_res
-    ones = np.ones((m, 1), dtype=np.float64)
-    system = np.block([[gram, ones], [ones.T, np.zeros((1, 1), dtype=np.float64)]])
-    rhs = np.zeros(m + 1, dtype=np.float64)
+def _split_state(state: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if state.shape[0] != 3:
+        raise ValueError("state 需要包含 [soma, apical, basal]")
+    return state[0], state[1], state[2]
+
+
+def _rms(values: np.ndarray) -> float:
+    flat = np.asarray(values, dtype=np.float64).ravel()
+    if flat.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(flat * flat)))
+
+
+def _phi_eval(phi: Callable[[np.ndarray], np.ndarray], state: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    phi_state = np.asarray(phi(state), dtype=np.float64)
+    delta = phi_state - state
+    fp_err = _rms(delta)
+    return phi_state, delta, fp_err
+
+
+def _anderson_ridge(delta_history: Sequence[np.ndarray], ridge: float) -> Optional[np.ndarray]:
+    if len(delta_history) < 2:
+        return None
+    mat = np.stack(delta_history, axis=1)  # (dim, n)
+    gram = mat.T @ mat
+    n = gram.shape[0]
+    lam = float(max(ridge, 0.0))
+    ones = np.ones((n, 1), dtype=np.float64)
+    system = np.block(
+        [
+            [gram + lam * np.eye(n, dtype=np.float64), ones],
+            [ones.T, np.zeros((1, 1), dtype=np.float64)],
+        ]
+    )
+    rhs = np.zeros(n + 1, dtype=np.float64)
     rhs[-1] = 1.0
     try:
-        solution = np.linalg.solve(system + 1e-10 * np.eye(m + 1, dtype=np.float64), rhs)
+        solution = np.linalg.solve(system, rhs)
     except np.linalg.LinAlgError:
-        return _apply_damped_update(prev, state_history[-1], damping)
-    coeffs = solution[:m]
+        return None
+    coeffs = solution[:n]
     if not np.all(np.isfinite(coeffs)):
-        return _apply_damped_update(prev, state_history[-1], damping)
-    mixed = np.zeros_like(prev)
-    for weight, state in zip(coeffs, state_history):
-        mixed += weight * state
-    beta_clamped = float(np.clip(beta, 0.0, 1.0))
-    return (1.0 - beta_clamped) * prev + beta_clamped * mixed
+        return None
+    return mat @ coeffs
+
+
+def _backtracking_step(
+    state: np.ndarray,
+    direction: np.ndarray,
+    phi: Callable[[np.ndarray], np.ndarray],
+    reference_err: float,
+    enabled: bool,
+) -> Tuple[np.ndarray, float, float]:
+    if not enabled:
+        new_state = state + direction
+        _, _, fp_err = _phi_eval(phi, new_state)
+        return new_state, fp_err, 1.0
+
+    for alpha in (1.0, 0.5, 0.25):
+        candidate = state + alpha * direction
+        _, _, fp_err = _phi_eval(phi, candidate)
+        if reference_err <= 0.0 or fp_err <= 0.99 * reference_err:
+            return candidate, fp_err, alpha
+    return state, reference_err, 0.0
 
 
 def fpt_solve(
@@ -96,58 +139,161 @@ def fpt_solve(
     solver: str = "anderson",
     m: int = 4,
     beta: float = 0.5,
-) -> Tuple[np.ndarray, int, float]:
-    """Generic fixed-point solver with optional Anderson acceleration.
-
-    Args:
-        phi: Callable that maps the previous iterate to the next candidate.
-        h0: Initial iterate vector.
-        K_max: Maximum number of iterations.
-        tol: Early-stop tolerance on the residual norm.
-        solver: "anderson" or "plain".
-        m: Anderson history length.
-        beta: Mixing factor for Anderson acceleration.
-
-    Returns:
-        (final_state, effective_iterations, final_residual)
-    """
+    ridge: float = 1e-4,
+    line_search: bool = True,
+    fp_err_guard: float = 5.0,
+    damping: float = 1.0,
+    logger: Optional[logging.Logger] = None,
+    trace: Optional[List[Tuple[int, float, float]]] = None,
+    allow_fallback: bool = True,
+) -> Tuple[np.ndarray, int, float, float]:
+    """Generic fixed-point solver with optional Anderson acceleration."""
 
     if K_max <= 0:
         raise ValueError("K_max must be positive")
     if tol <= 0.0:
         raise ValueError("tol must be positive")
-    h_prev = np.asarray(h0, dtype=np.float64)
+    state = np.asarray(h0, dtype=np.float64)
     solver_name = str(solver or "plain").lower()
     use_anderson = solver_name == "anderson" and m > 1
-    history_states: Deque[np.ndarray] = deque(maxlen=max(1, int(m)))
-    history_residuals: Deque[np.ndarray] = deque(maxlen=max(1, int(m)))
+    history: Deque[np.ndarray] = deque(maxlen=max(1, int(m)))
+    ridge_value = float(max(ridge, 0.0))
+    guard = float(max(fp_err_guard, 0.0))
+    damping = float(np.clip(damping, 1e-4, 1.0))
     beta_mix = float(np.clip(beta, 0.0, 1.0))
-    prev_residual = None
-    final_residual = float("inf")
-    effective_k = K_max
+    fp_err_final = float("inf")
+    iter_err_final = 0.0
+    effective_k = 0
+    if logger:
+        logger.info(
+            "固定点迭代开始：dim=%d, 迭代次数=%d, 阈值=%.2e, solver=%s",
+            int(state.size),
+            K_max,
+            tol,
+            solver_name,
+        )
+
     for iteration in range(1, K_max + 1):
-        candidate = np.asarray(phi(h_prev), dtype=np.float64)
-        residual_vec = candidate - h_prev
-        residual = float(np.linalg.norm(residual_vec))
-        final_residual = residual
-        if use_anderson:
-            history_states.append(candidate.copy())
-            history_residuals.append(residual_vec.copy())
-            h_next = _anderson_mix(h_prev, list(history_states), list(history_residuals), beta_mix, 1.0)
-        else:
-            h_next = candidate
-        ratio_trigger = False
-        if prev_residual is not None and prev_residual > 0.0:
-            ratio = residual / max(prev_residual, 1e-12)
-            ratio_trigger = ratio > 0.98
-        if residual <= tol or ratio_trigger:
-            h_prev = h_next
-            effective_k = iteration
+        phi_state, delta, fp_err = _phi_eval(phi, state)
+        if trace is not None:
+            trace.append((iteration, fp_err, 0.0))
+        if fp_err <= tol:
+            fp_err_final = fp_err
+            iter_err_final = 0.0
+            effective_k = iteration - 1
             break
-        h_prev = h_next
-        prev_residual = residual
+
+        step = delta * damping
+        if use_anderson:
+            history.append(delta.reshape(-1).copy())
+            mixed = _anderson_ridge(list(history), ridge_value)
+            if mixed is not None:
+                mixed = mixed.reshape(state.shape)
+                step = mixed
+                if beta_mix > 0.0:
+                    step = beta_mix * step
+                step *= damping
+
+        if not np.any(step):
+            fp_err_final = fp_err
+            iter_err_final = 0.0
+            effective_k = iteration - 1
+            break
+
+        new_state, fp_err_next, alpha = _backtracking_step(
+            state, step, phi, fp_err, bool(line_search)
+        )
+        iter_err = _rms(new_state - state)
+        if trace is not None:
+            trace[-1] = (iteration, fp_err, iter_err)
+        if logger:
+            logger.info(
+                "迭代 %d/%d，fp_err=%.3e iter_err=%.3e alpha=%.2f",
+                iteration,
+                K_max,
+                fp_err,
+                iter_err,
+                alpha,
+            )
+
+        if not np.isfinite(fp_err_next) or fp_err_next > guard:
+            if use_anderson and allow_fallback:
+                if logger:
+                    logger.warning("ANDERSON->PLAIN fallback (fp_err=%.3e)", fp_err_next)
+                return fpt_solve(
+                    phi,
+                    state,
+                    max(K_max, 6),
+                    tol,
+                    solver="plain",
+                    m=1,
+                    beta=0.2,
+                    ridge=ridge_value,
+                    line_search=line_search,
+                    fp_err_guard=guard,
+                    damping=damping,
+                    logger=logger,
+                    trace=trace,
+                    allow_fallback=False,
+                )
+            fp_err_final = fp_err_next
+            iter_err_final = iter_err
+            effective_k = iteration
+            return new_state.astype(np.float64, copy=False), effective_k, fp_err_final, iter_err_final
+
+        state = new_state
+        fp_err_final = fp_err_next
+        iter_err_final = iter_err
         effective_k = iteration
-    return h_prev.astype(np.float64, copy=False), effective_k, float(final_residual)
+        if fp_err_next <= tol:
+            break
+
+    return state.astype(np.float64, copy=False), effective_k, fp_err_final, iter_err_final
+
+
+def _build_three_compartment_phi(
+    params: ThreeCompartmentParams,
+    apical_input: np.ndarray,
+    basal_input: np.ndarray,
+    soma_input: np.ndarray,
+    init_soma: float,
+    init_apical: float,
+    init_basal: float,
+) -> Callable[[np.ndarray], np.ndarray]:
+    steps = apical_input.shape[0]
+    dt = float(params.dt)
+
+    def _phi(state: np.ndarray) -> np.ndarray:
+        soma_prev, ap_prev, ba_prev = _split_state(state)
+        soma_tm1 = np.empty_like(soma_prev)
+        ap_tm1 = np.empty_like(ap_prev)
+        ba_tm1 = np.empty_like(ba_prev)
+        soma_tm1[0] = init_soma
+        ap_tm1[0] = init_apical
+        ba_tm1[0] = init_basal
+        if steps > 1:
+            soma_tm1[1:] = soma_prev[:-1]
+            ap_tm1[1:] = ap_prev[:-1]
+            ba_tm1[1:] = ba_prev[:-1]
+
+        apical_leak = (params.v_rest - ap_tm1) / params.tau_apical
+        apical_coupling = params.coupling_apical * (soma_tm1 - ap_tm1)
+        ap_next = ap_tm1 + dt * (apical_leak + apical_coupling + apical_input)
+
+        basal_leak = (params.v_rest - ba_tm1) / params.tau_basal
+        basal_coupling = params.coupling_basal * (soma_tm1 - ba_tm1)
+        ba_next = ba_tm1 + dt * (basal_leak + basal_coupling + basal_input)
+
+        soma_leak = (params.v_rest - soma_tm1) / params.tau_soma
+        soma_coupling = (
+            params.coupling_apical * (ap_next - soma_tm1)
+            + params.coupling_basal * (ba_next - soma_tm1)
+        )
+        soma_next = soma_tm1 + dt * (soma_leak + soma_coupling + soma_input)
+
+        return _stack_state(soma_next, ap_next, ba_next)
+
+    return _phi
 
 
 def fixed_point_parallel_solve(
@@ -175,8 +321,6 @@ def fixed_point_parallel_solve(
 
     if config.iterations <= 0:
         raise ValueError("iterations 必须为正整数")
-    if not (0.0 < config.damping <= 1.0):
-        raise ValueError("damping 需位于 (0, 1] 区间")
 
     apical = _to_list(apical_currents, name="apical_currents")
     basal = _to_list(basal_currents, name="basal_currents")
@@ -200,121 +344,65 @@ def fixed_point_parallel_solve(
         else (params.v_rest, params.v_rest, params.v_rest)
     )
 
-    soma = _initial_vector(steps, init_soma)
-    apical_state = _initial_vector(steps, init_apical)
-    basal_state = _initial_vector(steps, init_basal)
-
-    residuals: List[float] = []
-
-    dt = params.dt
-    damping = config.damping
-    solver_name = (config.solver or "plain").lower()
-    use_anderson = solver_name == "anderson"
-    history_states: Deque[np.ndarray] = deque(maxlen=max(1, config.anderson_m))
-    history_residuals: Deque[np.ndarray] = deque(maxlen=max(1, config.anderson_m))
-    beta_mix = float(np.clip(config.anderson_beta, 0.0, 1.0))
-
-    logger.info(
-        "固定点迭代开始：步数=%d, 迭代次数=%d, 阈值=%.2e, 阻尼=%.2f",
-        steps,
-        config.iterations,
-        config.tolerance,
-        damping,
+    apical_arr = np.asarray(apical, dtype=np.float64)
+    basal_arr = np.asarray(basal, dtype=np.float64)
+    soma_arr = np.asarray(soma_input, dtype=np.float64)
+    h0 = _stack_state(
+        np.full(steps, init_soma, dtype=np.float64),
+        np.full(steps, init_apical, dtype=np.float64),
+        np.full(steps, init_basal, dtype=np.float64),
     )
 
-    prev_residual_value: Optional[float] = None
+    phi_fn = _build_three_compartment_phi(
+        params,
+        apical_arr,
+        basal_arr,
+        soma_arr,
+        init_soma,
+        init_apical,
+        init_basal,
+    )
 
-    for iteration in range(1, config.iterations + 1):
-        prev_soma = soma[:]
-        prev_apical = apical_state[:]
-        prev_basal = basal_state[:]
+    trace: List[Tuple[int, float, float]] = []
+    h_final, k_eff, fp_err, iter_err = fpt_solve(
+        phi_fn,
+        h0,
+        config.iterations,
+        config.tolerance,
+        solver=config.solver,
+        m=config.anderson_m,
+        beta=config.anderson_beta,
+        ridge=config.anderson_ridge,
+        line_search=config.line_search,
+        fp_err_guard=config.fp_err_guard,
+        damping=config.damping,
+        logger=logger,
+        trace=trace,
+    )
 
-        soma_tm1 = [init_soma] + prev_soma[:-1]
-        apical_tm1 = [init_apical] + prev_apical[:-1]
-        basal_tm1 = [init_basal] + prev_basal[:-1]
-
-        apical_candidate: List[float] = []
-        basal_candidate: List[float] = []
-        soma_candidate: List[float] = []
-
-        for idx in range(steps):
-            apical_leak = (params.v_rest - apical_tm1[idx]) / params.tau_apical
-            apical_coupling = params.coupling_apical * (soma_tm1[idx] - apical_tm1[idx])
-            apical_candidate.append(
-                apical_tm1[idx] + dt * (apical_leak + apical_coupling + apical[idx])
-            )
-
-            basal_leak = (params.v_rest - basal_tm1[idx]) / params.tau_basal
-            basal_coupling = params.coupling_basal * (soma_tm1[idx] - basal_tm1[idx])
-            basal_candidate.append(
-                basal_tm1[idx] + dt * (basal_leak + basal_coupling + basal[idx])
-            )
-
-        for idx in range(steps):
-            soma_leak = (params.v_rest - soma_tm1[idx]) / params.tau_soma
-            soma_coupling = (
-                params.coupling_apical * (apical_candidate[idx] - soma_tm1[idx])
-                + params.coupling_basal * (basal_candidate[idx] - soma_tm1[idx])
-            )
-            soma_candidate.append(
-                soma_tm1[idx] + dt * (soma_leak + soma_coupling + soma_input[idx])
-            )
-
-        for idx in range(steps):
-            apical_state[idx] = (1.0 - damping) * prev_apical[idx] + damping * apical_candidate[idx]
-            basal_state[idx] = (1.0 - damping) * prev_basal[idx] + damping * basal_candidate[idx]
-
-        prev_soma_arr = np.asarray(prev_soma, dtype=np.float64)
-        soma_candidate_arr = np.asarray(soma_candidate, dtype=np.float64)
-        if use_anderson:
-            residual_vec = soma_candidate_arr - prev_soma_arr
-            history_states.append(soma_candidate_arr.copy())
-            history_residuals.append(residual_vec.copy())
-            updated_soma_arr = _anderson_mix(
-                prev_soma_arr,
-                list(history_states),
-                list(history_residuals),
-                beta_mix,
-                damping,
-            )
-        else:
-            updated_soma_arr = _apply_damped_update(prev_soma_arr, soma_candidate_arr, damping)
-        soma = updated_soma_arr.tolist()
-
-        soma_diff = float(np.max(np.abs(updated_soma_arr - prev_soma_arr)))
-        apical_diff = float(
-            np.max(np.abs(np.asarray(apical_state, dtype=np.float64) - np.asarray(prev_apical, dtype=np.float64)))
-        )
-        basal_diff = float(
-            np.max(np.abs(np.asarray(basal_state, dtype=np.float64) - np.asarray(prev_basal, dtype=np.float64)))
-        )
-        residual = max(soma_diff, apical_diff, basal_diff)
-        residuals.append(residual)
-        logger.info("迭代 %d/%d，残差=%.3e", iteration, config.iterations, residual)
-
-        if residual <= config.tolerance:
-            logger.info("残差 %.3e 已低于阈值 %.3e，提前停止迭代", residual, config.tolerance)
-            break
-
-        if prev_residual_value is not None and prev_residual_value > 0.0:
-            ratio = residual / max(prev_residual_value, 1e-12)
-            if ratio > 0.98:
-                logger.info("残差比值 %.3f 达到阈值，提前停止迭代", ratio)
-                break
-        prev_residual_value = residual
-
-    times = [dt * (idx + 1.0) for idx in range(steps)]
-    spike_flags = [value >= params.threshold for value in soma]
+    soma_state, apical_state, basal_state = _split_state(h_final)
+    times = [params.dt * (idx + 1.0) for idx in range(steps)]
+    spike_flags = [float(value) >= params.threshold for value in soma_state]
 
     states = [
         CompartmentState(
             time=times[idx],
-            soma=soma[idx],
-            apical=apical_state[idx],
-            basal=basal_state[idx],
-            spike=spike_flags[idx],
+            soma=float(soma_state[idx]),
+            apical=float(apical_state[idx]),
+            basal=float(basal_state[idx]),
+            spike=bool(spike_flags[idx]),
         )
         for idx in range(steps)
     ]
 
-    return FixedPointResult(states=states, residuals=residuals)
+    residuals = [entry[1] for entry in trace]
+    iter_history = [entry[2] for entry in trace]
+
+    return FixedPointResult(
+        states=states,
+        residuals=residuals,
+        iter_errors=iter_history,
+        effective_iterations=k_eff,
+        final_fp_error=fp_err,
+        final_iter_error=iter_err,
+    )

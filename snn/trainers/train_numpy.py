@@ -28,6 +28,8 @@ import numpy as np
 import yaml
 import nats
 
+from snn.fpt import fpt_solve
+
 # ---------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------
@@ -122,6 +124,50 @@ def load_dataset(name: str, data_root: str) -> Tuple[np.ndarray, np.ndarray, np.
     in_dim = Xtr.shape[1]
     num_classes = 10
     return Xtr, ytr, Xte, yte, in_dim, num_classes
+
+
+def spectral_norm(W: np.ndarray, power_iters: int = 20, eps: float = 1e-8) -> float:
+    if W.size == 0:
+        return 0.0
+    mat = np.asarray(W, dtype=np.float64)
+    rng = np.random.default_rng()
+    v = rng.standard_normal((mat.shape[1], 1))
+    v /= np.linalg.norm(v) + eps
+    u = mat @ v
+    for _ in range(power_iters):
+        norm_u = np.linalg.norm(u)
+        if norm_u < eps:
+            break
+        u /= max(norm_u, eps)
+        v = mat.T @ u
+        norm_v = np.linalg.norm(v)
+        if norm_v < eps:
+            break
+        v /= max(norm_v, eps)
+        u = mat @ v
+    sigma = float((u.T @ mat @ v))
+    return abs(sigma)
+
+
+def rescale_to_spectral_radius(W: np.ndarray, rho: float, power_iters: int = 20) -> Tuple[float, float]:
+    sigma = spectral_norm(W, power_iters=power_iters)
+    if rho <= 0.0 or sigma <= 0.0:
+        return sigma, sigma
+    if sigma <= rho:
+        return sigma, sigma
+    scale = rho / (sigma + 1e-12)
+    W *= scale
+    return sigma, sigma * scale
+
+
+def as_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "off"}
+    return bool(value)
 
 def compute_or_load_norm(name: str, data_root: str, Xtr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     stat_dir = os.path.join(data_root, name.upper())
@@ -327,37 +373,56 @@ class FPTBlock:
 
     @staticmethod
     def phi(x, h, Wxh, Whh, bh):
-        return np.tanh(x @ Wxh + h @ Whh + bh)
+        pre = x @ Wxh + h @ Whh + bh
+        pre = np.clip(pre, -8.0, 8.0)
+        return np.tanh(pre)
 
     @staticmethod
-    def anderson_solve(x, h0, Wxh, Whh, bh, K, tol, m=4, beta=0.5, logger=None):
-        h_prev = h0
-        deltas = []
-        for k in range(1, K+1):
-            h_next = FPTBlock.phi(x, h_prev, Wxh, Whh, bh)
-            d = (h_next - h_prev).reshape(h_next.shape[0], -1)
-            res = float(np.sqrt((d*d).mean()))
-            if logger:
-                if k == 1:
-                    logger.info(f"固定点迭代开始：步数={x.shape[0]}, 迭代次数={K}, 阈值={tol:.2e}, 阻尼={beta:.2f}")
-                logger.info(f"迭代 {k}/{K}，残差={res:.3e}")
-            if res < tol:
-                if logger:
-                    logger.info(f"残差 {res:.3e} 已低于阈值 {tol:.3e}，提前停止迭代")
-                return h_next, k, res
-            deltas.append((h_next - h_prev).copy())
-            if len(deltas) >= m:
-                # Simple batch-averaged Anderson mixing
-                G = np.stack(deltas[-m:], axis=1).mean(axis=0)  # [H] averaged vector per slot
-                # reduce to vector
-                g = G.reshape(-1)
-                denom = float(np.dot(g, g)) + 1e-9
-                alpha = float(np.dot(g, (h_next - h_prev).reshape(-1))) / denom
-                h_mix = h_prev + alpha * (h_next - h_prev)
-                h_prev = (1.0 - beta) * h_prev + beta * h_mix
-            else:
-                h_prev = h_next
-        return h_prev, K, res
+    def anderson_solve(
+        x: np.ndarray,
+        h0: np.ndarray,
+        Wxh: np.ndarray,
+        Whh: np.ndarray,
+        bh: np.ndarray,
+        K: int,
+        tol: float,
+        m: int = 4,
+        beta: float = 0.5,
+        *,
+        solver: str = "anderson",
+        line_search: bool = True,
+        ridge: float = 1e-4,
+        fp_err_guard: float = 5.0,
+        damping: float = 1.0,
+        logger: Optional[logging.Logger] = None,
+    ) -> Tuple[np.ndarray, int, float, float]:
+        x_term = np.asarray(x @ Wxh, dtype=np.float64)
+        Whh64 = np.asarray(Whh, dtype=np.float64)
+        bh64 = np.asarray(bh, dtype=np.float64)
+
+        def _phi(state: np.ndarray) -> np.ndarray:
+            state64 = np.asarray(state, dtype=np.float64)
+            pre = np.clip(x_term + state64 @ Whh64 + bh64, -8.0, 8.0)
+            return np.tanh(pre)
+
+        trace: List[Tuple[int, float, float]] = []
+        h_init = np.asarray(h0, dtype=np.float64)
+        h_next, k_eff, fp_err, iter_err = fpt_solve(
+            _phi,
+            h_init,
+            K,
+            tol,
+            solver=solver,
+            m=m,
+            beta=beta,
+            ridge=ridge,
+            line_search=line_search,
+            fp_err_guard=fp_err_guard,
+            damping=damping,
+            logger=logger,
+            trace=trace,
+        )
+        return h_next.astype(np.float32), k_eff, fp_err, iter_err
 # ---------------------------------------------------------------------
 # Optimizer & Scheduler
 # ---------------------------------------------------------------------
@@ -470,14 +535,19 @@ class NPTrainer:
         head_lr = float(self.tr.get("head_lr", self.tr.get("lr", 1e-3)))
         rec_lr  = float(self.tr.get("rec_lr",  self.tr.get("lr", 1e-3)))
         head_only = bool(self.tr.get("head_only", True))
-        unfreeze_at_conf = float(self.tr.get("unfreeze_at_conf", 0.13))
+        unfreeze_at_conf = float(self.tr.get("unfreeze_at_conf", 0.20))
         weight_decay = float(self.tr.get("weight_decay", 1e-4))
         grad_clip = float(self.tr.get("grad_clip", 1.0))
         total_steps = int(self.tr.get("total_steps", 0))
         warmup_ratio = float(self.tr.get("warmup_ratio", 0.05))
         min_lr_ratio = float(self.tr.get("min_lr_ratio", 0.1))
+        fp_damping = float(self.tr.get("fp_damping", 1.0))
+        line_search_cfg = as_bool(self.tr.get("line_search", True), True)
+        fp_guard = float(self.tr.get("fp_err_guard", 5.0))
+        val_max_steps = int(self.tr.get("val_max_steps", 0))
 
         params = head.params()
+        head_param_count = len(params)
         lrs    = [head_lr for _ in params]
 
         # Add recurrent params when not head_only
@@ -527,46 +597,70 @@ class NPTrainer:
                 core.v_th = v0 + (v1-v0)*(ep-1)/max(1,(epochs-1))
 
             # train loop
+            last_conf_b = None
             for step, (xb, yb) in enumerate(iter_minibatches(Xtr, ytr, batch, steps_per_epoch, augment=augment), start=1):
+                fp_err = None
+                iter_err = None
                 global_step += 1
                 # forward (core)
                 if self.mode == "tstep":
                     S, s_mean = core.forward_states(xb)
                     Z = s_mean
                 else:
-                    # FPT solve
                     K_max = int(self.tr.get("K", 4))
                     tol = float(self.tr.get("tol", 1e-5))
                     solver = self.tr.get("solver", "anderson").lower()
-                    if solver == "anderson":
-                        h0 = np.zeros((xb.shape[0], hidden), np.float32)
-                        hK, k_eff, residual = FPTBlock.anderson_solve(xb, h0, core.Wxh, core.Whh, core.bh,
-                                                                      K=K_max, tol=tol,
-                                                                      m=int(self.tr.get("anderson_m",4)),
-                                                                      beta=float(self.tr.get("anderson_beta",0.5)),
-                                                                      logger=log_fpt)
-                    else:
-                        # plain fixed-point
-                        h_prev = np.zeros((xb.shape[0], hidden), np.float32)
-                        residual = 0.0; k_eff = K_max
-                        log_fpt.info(f"固定点迭代开始：步数={xb.shape[0]}, 迭代次数={K_max}, 阈值={tol:.2e}, 阻尼=1.00")
-                        for k in range(1, K_max+1):
-                            h_next = FPTBlock.phi(xb, h_prev, core.Wxh, core.Whh, core.bh)
-                            d = (h_next - h_prev).reshape(h_next.shape[0], -1)
-                            residual = float(np.sqrt((d*d).mean()))
-                            log_fpt.info(f"迭代 {k}/{K_max}，残差={residual:.3e}")
-                            h_prev = h_next
-                            if residual < tol:
-                                log_fpt.info(f"残差 {residual:.3e} 已低于阈值 {tol:.3e}，提前停止迭代")
-                                k_eff = k
-                                break
-                        hK = h_prev
+                    h0 = np.zeros((xb.shape[0], hidden), np.float32)
+                    hK, k_eff, fp_err, iter_err = FPTBlock.anderson_solve(
+                        xb,
+                        h0,
+                        core.Wxh,
+                        core.Whh,
+                        core.bh,
+                        K=K_max,
+                        tol=tol,
+                        m=int(self.tr.get("anderson_m", 4)),
+                        beta=float(self.tr.get("anderson_beta", 0.5)),
+                        solver=solver,
+                        line_search=line_search_cfg,
+                        ridge=float(self.tr.get("anderson_ridge", 1e-4)),
+                        fp_err_guard=fp_guard,
+                        damping=fp_damping,
+                        logger=log_fpt,
+                    )
                     Z = hK
-                    await js_publish(self.js, self.sb["train_iter"] if "train_iter" in self.sb else self.sb["logs"],
-                                     {"epoch": ep, "step": step, "k": int(k_eff), "residual": float(residual), "solver": solver, "ts": time.time()})
+                    await js_publish(
+                        self.js,
+                        self.sb["train_iter"] if "train_iter" in self.sb else self.sb["logs"],
+                        {
+                            "epoch": ep,
+                            "step": step,
+                            "k": int(k_eff),
+                            "residual": float(fp_err),
+                            "fp_err": float(fp_err),
+                            "iter_err": float(iter_err),
+                            "solver": solver,
+                            "ts": time.time(),
+                        },
+                    )
+
+                if not np.all(np.isfinite(Z)):
+                    await send_log(
+                        self.js,
+                        self.sb["logs"],
+                        f"[nan-guard] epoch={ep} step={step} 检测到隐藏状态非法值，跳过该 batch",
+                    )
+                    continue
 
                 # forward (head)
                 logits, cache = head.forward(Z)
+                if not np.all(np.isfinite(logits)):
+                    await send_log(
+                        self.js,
+                        self.sb["logs"],
+                        f"[nan-guard] epoch={ep} step={step} 检测到 logits 非法值，跳过该 batch",
+                    )
+                    continue
                 nll, probs, log_probs = softmax_nll(logits, yb)
                 pred = np.argmax(probs, axis=1)
                 acc_b = float(np.mean(pred == yb))
@@ -576,14 +670,33 @@ class NPTrainer:
                 logit_mean = float(np.mean(logits))
                 logit_std  = float(np.std(logits))
 
-                # build dlogits
-                dlogits = probs
-                dlogits[np.arange(yb.shape[0]), yb] -= 1.0
-                dlogits /= yb.shape[0]
+                conf_drop = last_conf_b is not None and (last_conf_b - conf_b) > 0.1
+                skip_update = logit_std > 10.0 or conf_drop
+                if skip_update:
+                    head.logit_scale[...] = np.clip(head.logit_scale * 0.8, scale_bounds[0], scale_bounds[1])
+                    await send_log(
+                        self.js,
+                        self.sb["logs"],
+                        f"[fuse] epoch={ep} step={step} reason={'logit_std' if logit_std > 10.0 else 'confidence_drop'}",
+                    )
 
-                # backward head
-                head.backward(cache, dlogits)
-                grads = head.grads()
+                stats = {"grad_norm": 0.0, "delta_norm": 0.0}
+                if not skip_update:
+                    dlogits = probs.copy()
+                    dlogits[np.arange(yb.shape[0]), yb] -= 1.0
+                    dlogits /= max(1, yb.shape[0])
+
+                    # backward head
+                    head.backward(cache, dlogits)
+                    grads = head.grads()
+
+                # set grads
+                cur_lrs = sch.get_lrs()
+                opt.lrs = cur_lrs[:len(opt.lrs)]
+                if not skip_update:
+                    opt.set_grads(grads)
+                    stats = opt.step(grad_clip=grad_clip)
+                sch.step()
 
                 # rate regularization (T-step only; monitor; no gradient to head)
                 rate = 0.0
@@ -619,14 +732,22 @@ class NPTrainer:
                 steps += 1
                 tps = seen / max(1e-6, time.time()-t0)
                 # publish metrics batch
+                lr_head_val = float(opt.lrs[0]) if opt.lrs else head_lr
+                lr_rec_val = (
+                    float(opt.lrs[head_param_count]) if len(opt.lrs) > head_param_count else None
+                )
                 payload = {
                     "epoch": ep, "step": step,
                     "loss": float(nll), "acc": acc_b, "top5": top5_b,
-                    "throughput": tps, "lr": float(opt.lrs[0]),
+                    "throughput": tps, "lr": lr_head_val,
                     "nll": float(nll), "conf": conf_b, "entropy": entropy_b,
                     "logit_mean": logit_mean, "logit_std": logit_std,
                     "s_rate": rate if self.mode == "tstep" else None,
                     "grad_norm": stats["grad_norm"], "delta_norm": stats["delta_norm"],
+                    "fp_err": float(fp_err) if fp_err is not None else None,
+                    "iter_err": float(iter_err) if iter_err is not None else None,
+                    "lr_head": lr_head_val,
+                    "lr_rec": lr_rec_val,
                     "ts": time.time()
                 }
                 await js_publish(self.js, self.sb["metrics"], payload)
@@ -637,20 +758,46 @@ class NPTrainer:
 
                 # clamp logit scale if learnable
                 head.clamp_scale()
+                last_conf_b = conf_b
+
+            if self.mode == "fpt" and not head_only:
+                rho_target = float(self.tr.get("spectral_rho", 0.9))
+                if rho_target > 0.0:
+                    sigma_before, sigma_after = rescale_to_spectral_radius(core.Whh, rho_target)
+                    if sigma_after < sigma_before - 1e-6:
+                        await send_log(
+                            self.js,
+                            self.sb["logs"],
+                            f"[spectral] clamp Whh sigma={sigma_before:.4f}->{sigma_after:.4f}",
+                        )
 
             # validation
             v_seen=v_cor=v_steps=0; v_loss=0.0; v_top5=0.0; v_conf=0.0
-            for xb, yb in iter_minibatches(Xte, yte, batch, steps_per_epoch=min(50, math.ceil(Xte.shape[0]/batch)), augment=False):
+            val_steps_use = math.ceil(Xte.shape[0] / batch)
+            if val_max_steps > 0:
+                val_steps_use = min(val_steps_use, val_max_steps)
+            for xb, yb in iter_minibatches(Xte, yte, batch, steps_per_epoch=val_steps_use, augment=False):
                 if self.mode == "tstep":
                     _, s_mean = core.forward_states(xb)
                     Z = s_mean
                 else:
                     h0 = np.zeros((xb.shape[0], hidden), np.float32)
-                    hK, _, _ = FPTBlock.anderson_solve(xb, h0, core.Wxh, core.Whh, core.bh,
-                                                       K=int(self.tr.get("K",4)),
-                                                       tol=float(self.tr.get("tol",1e-5)),
-                                                       m=int(self.tr.get("anderson_m",4)),
-                                                       beta=float(self.tr.get("anderson_beta",0.5)))
+                    hK, _, _, _ = FPTBlock.anderson_solve(
+                        xb,
+                        h0,
+                        core.Wxh,
+                        core.Whh,
+                        core.bh,
+                        K=int(self.tr.get("K", 4)),
+                        tol=float(self.tr.get("tol", 1e-5)),
+                        m=int(self.tr.get("anderson_m", 4)),
+                        beta=float(self.tr.get("anderson_beta", 0.5)),
+                        solver=self.tr.get("solver", "anderson").lower(),
+                        line_search=line_search_cfg,
+                        ridge=float(self.tr.get("anderson_ridge", 1e-4)),
+                        fp_err_guard=fp_guard,
+                        damping=fp_damping,
+                    )
                     Z = hK
                 logits, _ = head.forward(Z)
                 nll, probs, _ = softmax_nll(logits, yb)

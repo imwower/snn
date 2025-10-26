@@ -7,3 +7,4 @@ __pycache__/
 /ui-vue/node_modules/
 /ui-vue/dist
 .data
+checkpoints/
