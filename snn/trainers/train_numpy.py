@@ -256,65 +256,127 @@ def l2_norm(arrs) -> float:
 # Readout Head (MLP)
 # ---------------------------------------------------------------------
 class ReadoutMLP:
-    def __init__(self, in_dim: int, hidden: int, out_dim: int, seed: int = 42, init_scale: float = 0.02, learn_logit_scale: bool = False, logit_scale_init: float = 1.25, scale_bounds=(0.5, 3.0)):
-        rs = np.random.RandomState(seed)
-        self.W1 = (rs.randn(in_dim, hidden).astype(np.float32) * init_scale)
+    def __init__(
+        self,
+        in_dim: int,
+        hidden: int,
+        out_dim: int,
+        seed: int = 42,
+        init_scale: float = 0.02,
+        *,
+        layer_norm: bool = True,
+        dropout_prob: float = 0.0,
+        learn_logit_scale: bool = False,
+        logit_scale_init: float = 1.25,
+        scale_bounds: Tuple[float, float] = (0.5, 3.0),
+        ln_eps: float = 1e-5,
+    ):
+        self.rng = np.random.RandomState(seed)
+        self.W1 = (self.rng.randn(in_dim, hidden).astype(np.float32) * init_scale)
         self.b1 = np.zeros((hidden,), np.float32)
-        self.W2 = (rs.randn(hidden, out_dim).astype(np.float32) * init_scale)
+        self.W2 = (self.rng.randn(hidden, out_dim).astype(np.float32) * init_scale)
         self.b2 = np.zeros((out_dim,), np.float32)
-        self.learn_logit_scale = learn_logit_scale
-        self.logit_scale = np.array([logit_scale_init], dtype=np.float32)
-        self.logit_bounds = scale_bounds
+        self.layer_norm = bool(layer_norm)
+        self.layer_norm_eps = float(ln_eps)
+        if self.layer_norm:
+            self.ln_gamma = np.ones((hidden,), np.float32)
+            self.ln_beta = np.zeros((hidden,), np.float32)
+            self.g_ln_gamma = np.zeros_like(self.ln_gamma)
+            self.g_ln_beta = np.zeros_like(self.ln_beta)
+        else:
+            self.ln_gamma = None
+            self.ln_beta = None
+            self.g_ln_gamma = None
+            self.g_ln_beta = None
+        self.dropout_prob = float(np.clip(dropout_prob, 0.0, 0.99))
+        self.keep_prob = 1.0 - self.dropout_prob
+        self.learn_logit_scale = bool(learn_logit_scale)
+        self.logit_scale = np.array([float(logit_scale_init)], dtype=np.float32)
+        lo, hi = scale_bounds
+        self.logit_bounds = (float(min(lo, hi)), float(max(lo, hi)))
         # grads
-        self.gW1 = np.zeros_like(self.W1); self.gb1 = np.zeros_like(self.b1)
-        self.gW2 = np.zeros_like(self.W2); self.gb2 = np.zeros_like(self.b2)
+        self.gW1 = np.zeros_like(self.W1)
+        self.gb1 = np.zeros_like(self.b1)
+        self.gW2 = np.zeros_like(self.W2)
+        self.gb2 = np.zeros_like(self.b2)
         self.g_scale = np.zeros_like(self.logit_scale)
 
-    @staticmethod
-    def act(x):  # tanh
-        return np.tanh(x)
-
-    @staticmethod
-    def d_act(y):  # derivative wrt output y = tanh(x)
-        return 1.0 - y*y
-
-    def forward(self, X: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        H1 = self.act(X @ self.W1 + self.b1)
-        logits = H1 @ self.W2 + self.b2
-        logits = logits * float(self.logit_scale[0])
-        cache = {"X": X, "H1": H1, "logits": logits}
+    def forward(self, X: np.ndarray, training: bool = True) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        pre = X @ self.W1 + self.b1
+        ln_norm = None
+        ln_inv_std = None
+        if self.layer_norm:
+            mean = np.mean(pre, axis=1, keepdims=True)
+            var = np.var(pre, axis=1, keepdims=True)
+            ln_inv_std = 1.0 / np.sqrt(var + self.layer_norm_eps)
+            ln_norm = (pre - mean) * ln_inv_std
+            pre = ln_norm * self.ln_gamma + self.ln_beta
+            ln_norm = ln_norm.astype(np.float32, copy=False)
+            ln_inv_std = ln_inv_std.astype(np.float32, copy=False)
+        tanh_out = np.tanh(pre).astype(np.float32, copy=False)
+        hidden = tanh_out
+        dropout_mask = None
+        if training and self.dropout_prob > 0.0:
+            mask = (self.rng.rand(*hidden.shape) >= self.dropout_prob).astype(np.float32)
+            mask /= max(self.keep_prob, 1e-6)
+            hidden = hidden * mask
+            dropout_mask = mask
+        raw_logits = hidden @ self.W2 + self.b2
+        logits = raw_logits * float(self.logit_scale[0])
+        cache = {
+            "X": X,
+            "hidden": hidden,
+            "tanh": tanh_out,
+            "ln_norm": ln_norm,
+            "ln_inv_std": ln_inv_std,
+            "dropout": dropout_mask,
+            "raw_logits": raw_logits,
+        }
         return logits, cache
 
     def backward(self, cache: Dict[str, np.ndarray], dlogits: np.ndarray):
-        # d logits (with scale)
         scale = float(self.logit_scale[0])
         dlogits_scaled = dlogits * scale
 
-        H1 = cache["H1"]; X = cache["X"]
-        # W2, b2
-        self.gW2[...] = H1.T @ dlogits_scaled
+        hidden = cache["hidden"]
+        X = cache["X"]
+        self.gW2[...] = hidden.T @ dlogits_scaled
         self.gb2[...] = dlogits_scaled.sum(axis=0)
-        # back to H1
-        dH1 = dlogits_scaled @ self.W2.T
-        # through tanh
-        dpre = dH1 * self.d_act(H1)
-        # W1, b1
-        self.gW1[...] = X.T @ dpre
-        self.gb1[...] = dpre.sum(axis=0)
-        # grad to logit_scale if learnable: d(loss)/d(scale) = sum(dlogits * logits_raw)
+        d_hidden = dlogits_scaled @ self.W2.T
+        if cache["dropout"] is not None:
+            d_hidden *= cache["dropout"]
+        d_pre = d_hidden * (1.0 - cache["tanh"] ** 2)
+        if self.layer_norm and cache["ln_norm"] is not None:
+            norm = cache["ln_norm"]
+            inv_std = cache["ln_inv_std"]
+            self.g_ln_gamma[...] = np.sum(d_pre * norm, axis=0)
+            self.g_ln_beta[...] = np.sum(d_pre, axis=0)
+            scaled = d_pre * self.ln_gamma
+            sum_scaled = np.sum(scaled, axis=1, keepdims=True)
+            sum_scaled_norm = np.sum(scaled * norm, axis=1, keepdims=True)
+            H = scaled.shape[1]
+            d_pre = (inv_std / H) * (H * scaled - sum_scaled - norm * sum_scaled_norm)
+        self.gW1[...] = X.T @ d_pre
+        self.gb1[...] = d_pre.sum(axis=0)
         if self.learn_logit_scale:
-            raw_logits = cache["logits"] / scale  # logits before scaling
+            raw_logits = cache["raw_logits"]
             self.g_scale[...] = np.sum(dlogits * raw_logits, dtype=np.float32, keepdims=True)
 
     def params(self):
+        params = [self.W1, self.b1, self.W2, self.b2]
+        if self.layer_norm:
+            params.extend([self.ln_gamma, self.ln_beta])
         if self.learn_logit_scale:
-            return [self.W1, self.b1, self.W2, self.b2, self.logit_scale]
-        return [self.W1, self.b1, self.W2, self.b2]
+            params.append(self.logit_scale)
+        return params
 
     def grads(self):
+        grads = [self.gW1, self.gb1, self.gW2, self.gb2]
+        if self.layer_norm:
+            grads.extend([self.g_ln_gamma, self.g_ln_beta])
         if self.learn_logit_scale:
-            return [self.gW1, self.gb1, self.gW2, self.gb2, self.g_scale]
-        return [self.gW1, self.gb1, self.gW2, self.gb2]
+            grads.append(self.g_scale)
+        return grads
 
     def clamp_scale(self):
         lo, hi = self.logit_bounds
@@ -427,48 +489,111 @@ class FPTBlock:
 # Optimizer & Scheduler
 # ---------------------------------------------------------------------
 class AdamW:
-    def __init__(self, params: list, lrs: list, betas=(0.9,0.999), eps=1e-8, weight_decay=1e-4):
-        self.params = params      # list of arrays
-        self.grads  = None        # to be set each step (same length as params)
-        self.m      = [np.zeros_like(p) for p in params]
-        self.v      = [np.zeros_like(p) for p in params]
-        self.t      = 0
-        self.lrs    = lrs         # per-parameter lr
+    def __init__(self, param_groups: list, betas=(0.9, 0.999), eps=1e-8):
+        if not param_groups:
+            raise ValueError("param_groups must be non-empty")
         self.b1, self.b2 = betas
-        self.eps    = eps
-        self.weight_decay = weight_decay
+        self.eps = eps
+        self.t = 0
+        self.groups = []
+        self.group_map = {}
+        for idx, group in enumerate(param_groups):
+            name = str(group.get("name", f"group{idx}"))
+            if name in self.group_map:
+                raise ValueError(f"duplicate optimizer group name: {name}")
+            params = list(group.get("params", []))
+            entry = {
+                "name": name,
+                "params": params,
+                "m": [np.zeros_like(p) for p in params],
+                "v": [np.zeros_like(p) for p in params],
+                "lr": float(group.get("lr", 1e-3)),
+                "weight_decay": float(group.get("weight_decay", 0.0)),
+                "grads": None,
+            }
+            self.groups.append(entry)
+            self.group_map[name] = entry
 
-    def set_grads(self, grads: list):
-        assert len(grads) == len(self.params)
-        self.grads = grads
+    @property
+    def group_names(self) -> list:
+        return [g["name"] for g in self.groups]
 
-    def step(self, grad_clip: Optional[float]=None) -> Dict[str, float]:
+    def has_group(self, name: str) -> bool:
+        return name in self.group_map
+
+    def get_group_lr(self, name: str) -> Optional[float]:
+        group = self.group_map.get(name)
+        return float(group["lr"]) if group is not None else None
+
+    def set_group_lrs(self, lrs: list):
+        if len(lrs) != len(self.groups):
+            raise ValueError("lr schedule length must match optimizer groups")
+        for lr, group in zip(lrs, self.groups):
+            group["lr"] = float(lr)
+
+    def add_params(self, name: str, new_params: list):
+        if not new_params:
+            return
+        group = self._require_group(name)
+        group["params"].extend(new_params)
+        group["m"].extend([np.zeros_like(p) for p in new_params])
+        group["v"].extend([np.zeros_like(p) for p in new_params])
+        group["grads"] = None
+
+    def set_grads(self, grads_by_group: Dict[str, Optional[list]]):
+        for group in self.groups:
+            grads = grads_by_group.get(group["name"])
+            if grads is None:
+                group["grads"] = None
+                continue
+            if len(grads) != len(group["params"]):
+                raise ValueError(f"gradient list for {group['name']} does not match parameters")
+            group["grads"] = grads
+
+    def step(self, grad_clip: Optional[float] = None) -> Dict[str, Dict[str, float]]:
         self.t += 1
-        # concat grad norm
-        gnorm_sq = 0.0
-        for g in self.grads:
-            gnorm_sq += float(np.sum(g*g))
-        gnorm = math.sqrt(gnorm_sq)
-
-        # clip
+        group_norm_sq = {}
+        total_gnorm_sq = 0.0
+        for group in self.groups:
+            grads = group["grads"]
+            if not grads:
+                group_norm_sq[group["name"]] = 0.0
+                continue
+            g_sq = 0.0
+            for grad in grads:
+                g_sq += float(np.sum(grad * grad))
+            group_norm_sq[group["name"]] = g_sq
+            total_gnorm_sq += g_sq
+        total_gnorm = math.sqrt(total_gnorm_sq)
         scale = 1.0
-        if grad_clip is not None and gnorm > grad_clip:
-            scale = grad_clip / (gnorm + 1e-12)
+        if grad_clip is not None and grad_clip > 0.0 and total_gnorm > grad_clip:
+            scale = grad_clip / (total_gnorm + 1e-12)
 
-        delta_sq = 0.0
-        for i, (p, g) in enumerate(zip(self.params, self.grads)):
-            gi = g * scale
-            # decoupled weight decay
-            p *= (1.0 - self.weight_decay)
-            # AdamW
-            self.m[i] = self.b1*self.m[i] + (1.0-self.b1)*gi
-            self.v[i] = self.b2*self.v[i] + (1.0-self.b2)*(gi*gi)
-            m_hat = self.m[i] / (1.0 - self.b1**self.t)
-            v_hat = self.v[i] / (1.0 - self.b2**self.t)
-            step = self.lrs[i] * m_hat / (np.sqrt(v_hat) + self.eps)
-            p[...] -= step
-            delta_sq += float(np.sum(step*step))
-        return {"grad_norm": gnorm, "delta_norm": math.sqrt(delta_sq)}
+        stats: Dict[str, Dict[str, float]] = {}
+        for group in self.groups:
+            grads = group["grads"]
+            delta_sq = 0.0
+            if grads:
+                for i, (param, grad) in enumerate(zip(group["params"], grads)):
+                    gi = grad * scale
+                    param *= (1.0 - group["weight_decay"])
+                    group["m"][i] = self.b1 * group["m"][i] + (1.0 - self.b1) * gi
+                    group["v"][i] = self.b2 * group["v"][i] + (1.0 - self.b2) * (gi * gi)
+                    m_hat = group["m"][i] / (1.0 - self.b1 ** self.t)
+                    v_hat = group["v"][i] / (1.0 - self.b2 ** self.t)
+                    step = group["lr"] * m_hat / (np.sqrt(v_hat) + self.eps)
+                    param[...] -= step
+                    delta_sq += float(np.sum(step * step))
+            stats[group["name"]] = {
+                "grad_norm": math.sqrt(group_norm_sq.get(group["name"], 0.0)),
+                "delta_norm": math.sqrt(delta_sq),
+            }
+        return stats
+
+    def _require_group(self, name: str) -> dict:
+        if name not in self.group_map:
+            raise KeyError(f"optimizer group '{name}' not found")
+        return self.group_map[name]
 
 class WarmupCosine:
     def __init__(self, base_lrs: list, total_steps: int, warmup_ratio: float=0.05, min_lr_ratio: float=0.1):
@@ -514,9 +639,14 @@ class NPTrainer:
         # Build model
         hidden = int(self.tr.get("network_size", 256))
         head_hidden = int(self.tr.get("head_hidden", 256))
-        learn_scale = bool(self.tr.get("learn_logit_scale", False))
+        head_ln = as_bool(self.tr.get("head_ln", True), True)
+        head_dropout = float(self.tr.get("head_dropout", 0.0))
+        head_dropout = float(np.clip(head_dropout, 0.0, 0.99))
+        learn_scale = bool(self.tr.get("learn_logit_scale", True))
         logit_scale_init = float(self.tr.get("logit_scale_init", 1.25))
-        scale_bounds = (float(self.tr.get("logit_scale_min", 0.5)), float(self.tr.get("logit_scale_max", 3.0)))
+        scale_lo = float(self.tr.get("logit_scale_min", 0.5))
+        scale_hi = float(self.tr.get("logit_scale_max", 3.0))
+        scale_bounds = (min(scale_lo, scale_hi), max(scale_lo, scale_hi))
 
         if self.mode == "tstep":
             core = ThreeCompTStep(in_dim, hidden, self.tr, seed=self.seed)
@@ -525,18 +655,25 @@ class NPTrainer:
             core = FPTBlock(in_dim, hidden, seed=self.seed)
             head_in = hidden
 
-        head = ReadoutMLP(head_in, head_hidden, num_classes,
-                          seed=self.seed,
-                          learn_logit_scale=learn_scale,
-                          logit_scale_init=logit_scale_init,
-                          scale_bounds=scale_bounds)
+        head = ReadoutMLP(
+            head_in,
+            head_hidden,
+            num_classes,
+            seed=self.seed,
+            layer_norm=head_ln,
+            dropout_prob=head_dropout,
+            learn_logit_scale=learn_scale,
+            logit_scale_init=logit_scale_init,
+            scale_bounds=scale_bounds,
+        )
 
         # Optimizer / Scheduler
         head_lr = float(self.tr.get("head_lr", self.tr.get("lr", 1e-3)))
         rec_lr  = float(self.tr.get("rec_lr",  self.tr.get("lr", 1e-3)))
         head_only = bool(self.tr.get("head_only", True))
         unfreeze_at_conf = float(self.tr.get("unfreeze_at_conf", 0.20))
-        weight_decay = float(self.tr.get("weight_decay", 1e-4))
+        weight_decay_head = float(self.tr.get("weight_decay_head", self.tr.get("weight_decay", 1e-4)))
+        weight_decay_rec = float(self.tr.get("weight_decay_rec", self.tr.get("weight_decay", 1e-4)))
         grad_clip = float(self.tr.get("grad_clip", 1.0))
         total_steps = int(self.tr.get("total_steps", 0))
         warmup_ratio = float(self.tr.get("warmup_ratio", 0.05))
@@ -546,18 +683,27 @@ class NPTrainer:
         fp_guard = float(self.tr.get("fp_err_guard", 5.0))
         val_max_steps = int(self.tr.get("val_max_steps", 0))
 
-        params = head.params()
-        head_param_count = len(params)
-        lrs    = [head_lr for _ in params]
+        param_groups = [
+            {
+                "name": "head",
+                "params": head.params(),
+                "lr": head_lr,
+                "weight_decay": weight_decay_head,
+            }
+        ]
+        has_rec_group = self.mode == "fpt"
+        if has_rec_group:
+            rec_params = [] if head_only else [core.Wxh, core.Whh, core.bh]
+            param_groups.append(
+                {
+                    "name": "rec",
+                    "params": rec_params,
+                    "lr": rec_lr,
+                    "weight_decay": weight_decay_rec,
+                }
+            )
 
-        # Add recurrent params when not head_only
-        rec_params = []
-        if self.mode == "fpt" and not head_only:
-            rec_params = [core.Wxh, core.Whh, core.bh]
-            params.extend(rec_params)
-            lrs.extend([rec_lr, rec_lr, rec_lr])
-
-        opt = AdamW(params, lrs, betas=(0.9,0.999), eps=1e-8, weight_decay=weight_decay)
+        opt = AdamW(param_groups, betas=(0.9,0.999), eps=1e-8)
 
         # steps_per_epoch
         batch = int(self.tr.get("batch_size", 64))
@@ -565,13 +711,20 @@ class NPTrainer:
         if steps_per_epoch is None or int(steps_per_epoch) <= 0:
             steps_per_epoch = math.ceil(Xtr.shape[0] / batch)
         total_steps = total_steps if total_steps > 0 else steps_per_epoch * int(self.tr.get("epochs", 1))
-        sch = WarmupCosine(opt.lrs, total_steps, warmup_ratio=warmup_ratio, min_lr_ratio=min_lr_ratio)
+        base_lrs = [head_lr]
+        if has_rec_group:
+            base_lrs.append(rec_lr)
+        sch = WarmupCosine(base_lrs, total_steps, warmup_ratio=warmup_ratio, min_lr_ratio=min_lr_ratio)
 
         augment = bool(self.tr.get("augment", True))
 
-        await send_log(self.js, self.sb["logs"],
-                       f"trainer start mode={self.mode} hidden={hidden} head_hidden={head_hidden} head_only={head_only} "
-                       f"lr_head={head_lr} lr_rec={rec_lr} logit_scale={float(head.logit_scale[0])} steps/ep={steps_per_epoch}")
+        await send_log(
+            self.js,
+            self.sb["logs"],
+            f"trainer start mode={self.mode} hidden={hidden} head_hidden={head_hidden} head_only={head_only} "
+            f"ln={head_ln} dropout={head_dropout:.2f} lr_head={head_lr} lr_rec={rec_lr} "
+            f"logit_scale={float(head.logit_scale[0])} steps/ep={steps_per_epoch}",
+        )
 
         best_acc = 0.0
         best_loss = 1e9
@@ -653,7 +806,7 @@ class NPTrainer:
                     continue
 
                 # forward (head)
-                logits, cache = head.forward(Z)
+                logits, cache = head.forward(Z, training=True)
                 if not np.all(np.isfinite(logits)):
                     await send_log(
                         self.js,
@@ -680,7 +833,8 @@ class NPTrainer:
                         f"[fuse] epoch={ep} step={step} reason={'logit_std' if logit_std > 10.0 else 'confidence_drop'}",
                     )
 
-                stats = {"grad_norm": 0.0, "delta_norm": 0.0}
+                stats: Dict[str, Dict[str, float]] = {}
+                grads_map: Optional[Dict[str, list]] = None
                 if not skip_update:
                     dlogits = probs.copy()
                     dlogits[np.arange(yb.shape[0]), yb] -= 1.0
@@ -688,13 +842,12 @@ class NPTrainer:
 
                     # backward head
                     head.backward(cache, dlogits)
-                    grads = head.grads()
+                    grads_map = {"head": head.grads()}
 
-                # set grads
                 cur_lrs = sch.get_lrs()
-                opt.lrs = cur_lrs[:len(opt.lrs)]
-                if not skip_update:
-                    opt.set_grads(grads)
+                opt.set_group_lrs(cur_lrs)
+                if grads_map is not None:
+                    opt.set_grads(grads_map)
                     stats = opt.step(grad_clip=grad_clip)
                 sch.step()
 
@@ -707,21 +860,10 @@ class NPTrainer:
                         reg_loss = rate_lambda * (rate - rate_target) ** 2
                         nll += reg_loss  # add to scalar loss, no head gradient
 
-                # set grads
-                opt.set_grads(grads)
-                # scheduler lrs (per param)
-                cur_lrs = sch.get_lrs()
-                opt.lrs = cur_lrs[:len(opt.lrs)]
-                stats = opt.step(grad_clip=grad_clip)
-                sch.step()
-
                 # optional: unfreeze recurrent after conf high enough (FPT)
                 if self.mode == "fpt" and head_only and conf_b >= unfreeze_at_conf:
                     head_only = False
-                    opt.params.extend([core.Wxh, core.Whh, core.bh])
-                    opt.m.extend([np.zeros_like(core.Wxh), np.zeros_like(core.Whh), np.zeros_like(core.bh)])
-                    opt.v.extend([np.zeros_like(core.Wxh), np.zeros_like(core.Whh), np.zeros_like(core.bh)])
-                    opt.lrs.extend([float(self.tr.get("rec_lr", 1e-3))]*3)
+                    opt.add_params("rec", [core.Wxh, core.Whh, core.bh])
                     await send_log(self.js, self.sb["logs"], f"unfreeze recurrent at conf={conf_b:.3f}")
 
                 # meters
@@ -732,18 +874,23 @@ class NPTrainer:
                 steps += 1
                 tps = seen / max(1e-6, time.time()-t0)
                 # publish metrics batch
-                lr_head_val = float(opt.lrs[0]) if opt.lrs else head_lr
-                lr_rec_val = (
-                    float(opt.lrs[head_param_count]) if len(opt.lrs) > head_param_count else None
-                )
+                lr_head_val = opt.get_group_lr("head") or head_lr
+                lr_rec_val = opt.get_group_lr("rec") if has_rec_group else None
+                head_stats = stats.get("head", {"grad_norm": 0.0, "delta_norm": 0.0})
+                rec_stats = None
+                if has_rec_group:
+                    rec_stats = stats.get("rec", {"grad_norm": 0.0, "delta_norm": 0.0})
                 payload = {
                     "epoch": ep, "step": step,
                     "loss": float(nll), "acc": acc_b, "top5": top5_b,
                     "throughput": tps, "lr": lr_head_val,
                     "nll": float(nll), "conf": conf_b, "entropy": entropy_b,
                     "logit_mean": logit_mean, "logit_std": logit_std,
+                    "logit_scale": float(head.logit_scale[0]),
                     "s_rate": rate if self.mode == "tstep" else None,
-                    "grad_norm": stats["grad_norm"], "delta_norm": stats["delta_norm"],
+                    "grad_norm": head_stats["grad_norm"], "delta_norm": head_stats["delta_norm"],
+                    "gnorm_head": head_stats["grad_norm"],
+                    "gnorm_rec": rec_stats["grad_norm"] if rec_stats else None,
                     "fp_err": float(fp_err) if fp_err is not None else None,
                     "iter_err": float(iter_err) if iter_err is not None else None,
                     "lr_head": lr_head_val,
@@ -756,7 +903,6 @@ class NPTrainer:
                 if step % 10 == 0:
                     await self._emit_spikes(Z)
 
-                # clamp logit scale if learnable
                 head.clamp_scale()
                 last_conf_b = conf_b
 
@@ -799,7 +945,7 @@ class NPTrainer:
                         damping=fp_damping,
                     )
                     Z = hK
-                logits, _ = head.forward(Z)
+                logits, _ = head.forward(Z, training=False)
                 nll, probs, _ = softmax_nll(logits, yb)
                 v_loss += float(nll); v_steps += 1
                 v_seen += xb.shape[0]
@@ -822,7 +968,7 @@ class NPTrainer:
             await js_publish(self.js, self.sb["metrics"], {
                 "epoch": ep, "step": 0,
                 "loss": float(val_loss), "acc": float(val_acc), "top5": float(top5_epoch),
-                "throughput": 0.0, "lr": float(opt.lrs[0]),
+                "throughput": 0.0, "lr": opt.get_group_lr("head") or head_lr,
                 "nll": float(val_loss), "conf": float(v_conf_epoch), "entropy": None,
                 "logit_mean": None, "logit_std": None,
                 "s_rate": None,

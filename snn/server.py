@@ -1558,7 +1558,9 @@ class TrainingService:
                     else:
                         head_inputs = logits_raw
                     head_inputs = head_inputs.astype(np.float32, copy=False)
-                    head_outputs, head_cache = model.head.forward(head_inputs, return_cache=True)
+                    head_outputs, head_cache = model.head.forward(
+                        head_inputs, training=True, return_cache=True
+                    )
                     scale_factor = model.logit_scale / temperature
                     logits = head_outputs * scale_factor
                     if not np.all(np.isfinite(logits)):
@@ -2522,7 +2524,7 @@ class TrainingService:
             else:
                 head_inputs = logits_raw
             head_inputs = head_inputs.astype(np.float32, copy=False)
-            head_outputs, _ = model.head.forward(head_inputs, return_cache=False)
+            head_outputs, _ = model.head.forward(head_inputs, training=False, return_cache=False)
             logits = head_outputs * (model.logit_scale / temperature)
             loss, probs = self._nll_from_logits(logits, batch_y, num_classes=dataset.num_classes)
             batch_size_actual = batch_x.shape[0]
