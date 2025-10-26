@@ -116,6 +116,9 @@ training_service:
   solver: anderson
   anderson_m: 4
   anderson_beta: 0.5
+  anderson_ridge: 1.0e-4
+  line_search: true
+  fp_err_guard: 5.0
   K_schedule: auto
   temperature: 1.0
   logit_scale: 1.25
@@ -123,6 +126,7 @@ training_service:
   logit_scale_init: 1.25
   logit_scale_min: 0.5
   logit_scale_max: 3.0
+  fp_damping: 0.85
   tstep_regularization:
     rate_reg_lambda: 0.001
     rate_target: 0.2
@@ -131,19 +135,22 @@ training_service:
   augment: true
   head_hidden: 64
   head_momentum: 0.9
-  unfreeze_at_conf: 0.13
+  unfreeze_at_conf: 0.20
+  ema_decay: 0.999
 
 train:
   augment: true
   head_hidden: 256
+  unfreeze_at_conf: 0.20
+  head_lr: 0.003
+  rec_lr: 0.001
+  val_max_steps: 0        # 0 表示全量
+  ema_decay: 0.999
   logit_scale_init: 1.25
   logit_scale_min: 0.5
   logit_scale_max: 3.0
-  unfreeze_at_conf: 0.13
   optimizer:
     type: adamw
-    head_lr: 0.003
-    rec_lr: 0.001
     betas: [0.9, 0.999]
     eps: 1.0e-8
     weight_decay: 1.0e-4
@@ -158,6 +165,10 @@ train:
   anderson_beta: 0.5
   K_schedule: [2, 3, 4]
   tol: 5.0e-6
+  anderson_ridge: 1.0e-4
+  line_search: true
+  fp_err_guard: 5.0
+  spectral_rho: 0.90
   fp_damping: 0.85
   lambda_contr: 1.0e-4
   rho_max: 0.9
@@ -169,5 +180,4 @@ train:
   beta_end: 6.0
   vth_start: 0.50
   vth_end: 0.55
-  ema_decay: 0.999
   label_smoothing: 0.00
