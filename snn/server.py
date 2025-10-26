@@ -105,7 +105,6 @@ class TrainingInitRequest(BaseModel):
     lr: float = Field(gt=0.0, description="学习率")
     K: int = Field(ge=1, description="固定点迭代次数 / 近邻大小")
     tol: float = Field(gt=0.0, description="固定点容差")
-    fp_damping: float = Field(default=0.85, gt=0.0, le=1.0, description="固定点阻尼系数")
     T: Optional[int] = Field(default=None, description="时间步长（tstep 模式）")
     epochs: int = Field(ge=1, description="训练轮次")
     solver: str = Field(default="plain", description="固定点求解器：plain 或 anderson")
@@ -836,7 +835,6 @@ class TrainingService:
             "lr": 1e-3,
             "K": 6,
             "tol": 5e-6,
-            "fp_damping": 0.85,
             "T": 12,
             "epochs": 40,
             "solver": "anderson",
@@ -863,6 +861,7 @@ class TrainingService:
             "logit_scale_min": 0.5,
             "logit_scale_max": 3.0,
             "unfreeze_at_conf": 0.13,
+            "train": {},
         }
         self._config = self._apply_overrides(base_config, defaults or {})
         self._task: Optional[asyncio.Task[None]] = None
@@ -923,6 +922,9 @@ class TrainingService:
         for field in simple_fields:
             if field in overrides and not isinstance(overrides[field], dict):
                 merged[field] = overrides[field]
+
+        if isinstance(overrides.get("train"), dict):
+            merged["train"] = copy.deepcopy(overrides["train"])
 
         scheduler_block = overrides.get("scheduler")
         if isinstance(scheduler_block, dict):
@@ -1042,7 +1044,17 @@ class TrainingService:
                 return format(value, fmt)
             return str(value)
 
-        fp_damping = _fmt(self._config.get("fp_damping", "n/a"), ".2f")
+        train_cfg = config.get("train") if isinstance(config.get("train"), dict) else None
+        damping_value: Optional[float] = None
+        if isinstance(train_cfg, dict):
+            raw = train_cfg.get("fp_damping")
+            if isinstance(raw, (int, float)):
+                damping_value = float(raw)
+        if damping_value is None:
+            fallback = self._config.get("fp_damping")
+            if isinstance(fallback, (int, float)):
+                damping_value = float(fallback)
+        fp_damping = _fmt(damping_value, ".2f")
         message = (
             f"[config:{reason}] dataset={dataset} mode={mode} epochs={epochs} layers={layers} "
             f"neurons={network_size} lr={_fmt(lr)} solver={solver} anderson_m={anderson_m} "
@@ -1067,7 +1079,7 @@ class TrainingService:
             "weight_decay": weight_decay,
             "grad_clip": grad_clip,
             "logit_scale": logit_scale,
-            "fp_damping": self._config.get("fp_damping"),
+            "fp_damping": damping_value,
             "rate_reg_lambda": rate_reg_lambda,
             "rate_target": rate_target,
         }
@@ -1099,6 +1111,16 @@ class TrainingService:
     async def init_training(self, payload: TrainingInitRequest) -> None:
         async with self._lock:
             self._config = self._apply_overrides(self._config, payload.model_dump())
+        fp_damping_value = None
+        train_cfg = self._config.get("train")
+        if isinstance(train_cfg, dict):
+            raw_damping = train_cfg.get("fp_damping")
+            if isinstance(raw_damping, (int, float)):
+                fp_damping_value = float(raw_damping)
+        if fp_damping_value is None:
+            fallback_damping = self._config.get("fp_damping")
+            if isinstance(fallback_damping, (int, float)):
+                fp_damping_value = float(fallback_damping)
         logger.info(
             "初始化训练参数：dataset=%s, mode=%s, epochs=%d, layers=%d, network_size=%d",
             payload.dataset,
@@ -1127,7 +1149,6 @@ class TrainingService:
                 "timesteps": payload.T,
                 "fixed_point_K": payload.K,
                 "fixed_point_tol": payload.tol,
-                "fixed_point_damping": payload.fp_damping,
                 "solver": payload.solver,
                 "anderson_m": payload.anderson_m,
                 "anderson_beta": payload.anderson_beta,
@@ -1151,6 +1172,7 @@ class TrainingService:
                 "logit_scale_min": self._config.get("logit_scale_min"),
                 "logit_scale_max": self._config.get("logit_scale_max"),
                 "unfreeze_at_conf": self._config.get("unfreeze_at_conf"),
+                "fixed_point_damping": fp_damping_value,
                 "time_unix": _current_millis(),
             },
         )
@@ -1214,8 +1236,9 @@ class TrainingService:
         timesteps = int(config.get("T") or 12)
         base_iterations = max(1, int(config.get("K", 3)))
         tolerance = float(_train_param("tol", config.get("tol", 1e-5)))
-        fp_damping = float(_train_param("fp_damping", config.get("fp_damping", 0.85)))
+        fp_damping = float(_train_param("fp_damping", 0.85))
         fp_damping = float(np.clip(fp_damping, 1e-3, 1.0))
+        self._config["fp_damping"] = fp_damping
         solver = str(_train_param("solver", config.get("solver", "anderson"))).lower()
         anderson_m = max(1, int(_train_param("anderson_m", config.get("anderson_m", 4))))
         anderson_beta = float(_train_param("anderson_beta", config.get("anderson_beta", 0.5)))
@@ -2349,7 +2372,10 @@ def create_app(message_queue_config: Optional[Dict[str, Any]] = None) -> FastAPI
     broker, queue = _build_broker(mq_config)
     dataset_service = DatasetService(broker)
     global_config = load_config()
-    training_service = TrainingService(broker, defaults=global_config.get("training_service"))
+    ts_defaults = copy.deepcopy(global_config.get("training_service") or {})
+    if "train" not in ts_defaults and isinstance(global_config.get("train"), dict):
+        ts_defaults["train"] = copy.deepcopy(global_config["train"])
+    training_service = TrainingService(broker, defaults=ts_defaults)
     log_buffer = LogRingBuffer(capacity=200)
     worker_nats_cfg = {}
     training_worker_cfg = global_config.get("training_worker") if isinstance(global_config, dict) else {}

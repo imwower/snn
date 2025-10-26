@@ -32,7 +32,6 @@ const defaultConfig = (): TrainingConfig => ({
   lr: 1e-3,
   K: 6,
   tol: 5e-6,
-  fp_damping: 0.85,
   T: 12,
   epochs: 40,
   solver: 'anderson',
@@ -163,13 +162,6 @@ export const useUiStore = defineStore('ui', {
       next.K = Math.max(1, Math.round(Number.isFinite(next.K) ? next.K : current.K));
       const tolValue = Number(next.tol);
       next.tol = Number.isFinite(tolValue) && tolValue > 0 ? tolValue : current.tol;
-      if (typeof next.fp_damping === 'number' && Number.isFinite(next.fp_damping)) {
-        next.fp_damping = Math.max(0.05, Math.min(1, next.fp_damping));
-      } else if (typeof current.fp_damping === 'number') {
-        next.fp_damping = current.fp_damping;
-      } else {
-        next.fp_damping = 0.85;
-      }
       if (typeof next.T === 'number' && Number.isFinite(next.T)) {
         next.T = Math.max(1, Math.round(next.T));
       } else {

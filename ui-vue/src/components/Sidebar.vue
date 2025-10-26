@@ -46,11 +46,6 @@
           <input type="number" min="1" v-model.number="epochs" />
           <span class="hint">训练轮次数量，建议至少 30~50 以给新 lr 调度充分时间。</span>
         </label>
-        <label>
-          <span>damping</span>
-          <input type="number" min="0.05" max="1" step="0.01" v-model.number="fpDamping" />
-          <span class="hint">固定点阻尼系数，0.8~0.9 可抑制震荡，默认 0.85。</span>
-        </label>
       </fieldset>
       <div class="training-tip">
         <p class="tip-title">推荐节奏</p>
@@ -120,10 +115,6 @@ const epochs = computed({
   get: () => store.cfg.epochs,
   set: (value: number) => store.setCfg({ epochs: value })
 });
-const fpDamping = computed({
-  get: () => store.cfg.fp_damping ?? 0.85,
-  set: (value: number) => store.setCfg({ fp_damping: value })
-});
 
 const downloadLocked = computed(() => store.isDownloadActive || isBusy.value);
 const parametersLocked = computed(() => isBusy.value || isTraining.value);
@@ -190,8 +181,7 @@ watch(
     store.cfg.solver,
     store.cfg.anderson_m,
     store.cfg.anderson_beta,
-    store.cfg.K_schedule,
-    store.cfg.fp_damping
+    store.cfg.K_schedule
   ],
   () => {
     hasInitialized.value = false;
@@ -265,7 +255,6 @@ const initTraining = () =>
         lr: store.cfg.lr,
         K: store.cfg.K,
         tol: store.cfg.tol,
-        fp_damping: store.cfg.fp_damping,
         T: store.cfg.T,
         epochs: store.cfg.epochs,
         solver: store.cfg.solver,
