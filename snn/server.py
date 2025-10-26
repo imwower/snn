@@ -842,7 +842,7 @@ class TrainingService:
             "anderson_beta": 0.5,
             "anderson_ridge": 1e-4,
             "line_search": True,
-            "fp_err_guard": 5.0,
+            "fp_err_guard": 1e-3,
             "K_schedule": None,
             "temperature": 1.0,
             "logit_scale": 1.25,
@@ -860,10 +860,10 @@ class TrainingService:
             "augment": True,
             "head_hidden": 64,
             "head_momentum": 0.9,
-            "logit_scale_init": 1.25,
+            "logit_scale_init": 1.60,
             "logit_scale_min": 0.5,
             "logit_scale_max": 3.0,
-            "unfreeze_at_conf": 0.20,
+            "unfreeze_at_conf": 0.15,
             "ema_decay": 0.999,
             "fp_damping": 0.85,
             "train": {},
@@ -1270,7 +1270,7 @@ class TrainingService:
             anderson_beta=anderson_beta,
             anderson_ridge=float(_train_param("anderson_ridge", config.get("anderson_ridge", 1e-4))),
             line_search=line_search_flag,
-            fp_err_guard=float(_train_param("fp_err_guard", config.get("fp_err_guard", 5.0))),
+            fp_err_guard=float(_train_param("fp_err_guard", config.get("fp_err_guard", 1e-3))),
         )
         kernel = self._get_basal_kernel(timesteps, base_iterations, tolerance, self._params.dt, fp_kernel_config)
         scheduler_name = "warmup_cosine"
@@ -1284,7 +1284,7 @@ class TrainingService:
         head_hidden = int(max(4, _train_param("head_hidden", config.get("head_hidden", 64))))
         head_momentum = float(_train_param("head_momentum", config.get("head_momentum", 0.9)))
         head_momentum = float(np.clip(head_momentum, 0.0, 0.999))
-        logit_scale_init = float(max(1e-6, _train_param("logit_scale_init", config.get("logit_scale_init", 1.25))))
+        logit_scale_init = float(max(1e-6, _train_param("logit_scale_init", config.get("logit_scale_init", 1.60))))
         initial_logit_scale = float(
             max(1e-6, _train_param("logit_scale", config.get("logit_scale", logit_scale_init)))
         )
@@ -1297,7 +1297,7 @@ class TrainingService:
         )
         logit_scale_learnable = bool(_train_param("logit_scale_learnable", True))
         unfreeze_threshold = float(
-            max(0.0, _train_param("unfreeze_at_conf", config.get("unfreeze_at_conf", 0.13)))
+            max(0.0, _train_param("unfreeze_at_conf", config.get("unfreeze_at_conf", 0.15)))
         )
         k_schedule_label = k_schedule_raw or "none"
         rate_reg_lambda = float(
@@ -1440,6 +1440,7 @@ class TrainingService:
         beta_value = getattr(self._params, "coupling_basal", 0.0)
         v_th_value = getattr(self._params, "threshold", 0.0)
         last_confidence: Optional[float] = None
+        global_max_confidence = 0.0
 
         try:
             for epoch in range(1, epochs + 1):
@@ -1457,6 +1458,7 @@ class TrainingService:
                 epoch_logit_sq_sum = 0.0
                 epoch_logit_count = 0
                 epoch_s_rate = 0.0
+                epoch_max_confidence = 0.0
                 epoch_bin, epoch_k_limit = self._k_limit_for_epoch(
                     epoch, epochs, k_schedule_values, base_iterations
                 )
@@ -1661,6 +1663,8 @@ class TrainingService:
                         epoch_logit_sq_sum += float(np.sum(logits ** 2))
                         epoch_logit_count += logits.size
                     last_confidence = confidence
+                    epoch_max_confidence = max(epoch_max_confidence, confidence)
+                    global_max_confidence = max(global_max_confidence, confidence)
                     grad_norm = 0.0
                     if head_frozen and unfreeze_threshold > 0.0 and confidence >= unfreeze_threshold:
                         head_frozen = False
@@ -1742,7 +1746,7 @@ class TrainingService:
                         anderson_beta=anderson_beta,
                         anderson_ridge=float(_train_param("anderson_ridge", config.get("anderson_ridge", 1e-4))),
                         line_search=line_search_flag,
-                        fp_err_guard=float(_train_param("fp_err_guard", config.get("fp_err_guard", 5.0))),
+                        fp_err_guard=float(_train_param("fp_err_guard", config.get("fp_err_guard", 1e-3))),
                     )
                     residual_value, actual_iters, spike_payload, iter_err_value = self._build_iteration_events(
                         model,
@@ -1829,24 +1833,41 @@ class TrainingService:
                     ema_loss_str = f"{ema_loss:.4f}" if ema_loss is not None else "nan"
                     ema_acc_str = f"{ema_acc:.4f}" if ema_acc is not None else "nan"
                     logger.info(
-                        "[BATCH] ep=%d st=%d loss=%.4f acc=%.4f top5=%.4f tps=%.1f step_ms=%.1f ema_loss=%s "
-                        "ema_acc=%s lr=%.5f examples=%d",
+                        "[BATCH] ep=%d st=%d ema_loss=%s ema_acc=%s | loss=%.4f acc=%.4f top5=%.4f "
+                        "tps=%.1f step_ms=%.1f lr=%.5f examples=%d",
                         epoch,
                         step + 1,
+                        ema_loss_str,
+                        ema_acc_str,
                         loss,
                         batch_acc,
                         top5_acc,
                         throughput,
                         step_duration * 1000.0,
-                        ema_loss_str,
-                        ema_acc_str,
                         current_lr,
                         batch_x.shape[0],
                     )
     
                     if step % 10 == 0:
                         await asyncio.sleep(0)
-    
+
+                if head_frozen and unfreeze_threshold > 0.0:
+                    await self._emit_log(
+                        "WARNING",
+                        (
+                            f"[backbone] still frozen after epoch={epoch}, "
+                            f"threshold={unfreeze_threshold:.3f} "
+                            f"epoch_max_conf={epoch_max_confidence:.3f} "
+                            f"global_max_conf={global_max_confidence:.3f}"
+                        ),
+                        metric={
+                            "epoch": epoch,
+                            "unfreeze_threshold": unfreeze_threshold,
+                            "epoch_max_conf": epoch_max_confidence,
+                            "global_max_conf": global_max_confidence,
+                        },
+                    )
+
                 eval_model = ema_model if use_ema and ema_model is not None else model
                 (
                     val_loss,
@@ -1865,17 +1886,25 @@ class TrainingService:
                     batch_size=512,
                     is_tstep=is_tstep_mode,
                 )
+                checkpoint_reason = None
                 if val_acc > best_acc:
                     best_acc = val_acc
+                    checkpoint_reason = f"acc={val_acc:.4f}"
+                if val_loss < best_loss - 1e-6:
+                    best_loss = val_loss
+                    checkpoint_reason = (
+                        f"loss={val_loss:.4f}"
+                        if checkpoint_reason is None
+                        else f"{checkpoint_reason}, loss={val_loss:.4f}"
+                    )
+                if checkpoint_reason is not None:
                     ckpt_path = self._save_checkpoint(eval_model, "best")
                     await self._emit_log(
                         "INFO",
                         (
-                            f"[checkpoint] saved best checkpoint epoch={epoch} acc={val_acc:.4f} path={ckpt_path}"
+                            f"[checkpoint] saved best checkpoint epoch={epoch} reason={checkpoint_reason} path={ckpt_path}"
                         ),
                     )
-                if val_loss < best_loss:
-                    best_loss = val_loss
                 epoch_duration = time.perf_counter() - epoch_start
                 avg_throughput = float(np.mean(batch_throughputs)) if batch_throughputs else None
                 denom = max(epoch_examples, 1)

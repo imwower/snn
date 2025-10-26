@@ -43,7 +43,7 @@ training_worker:
     logit_scale:
       value: 1.25
       learnable: false
-    logit_scale_init: 1.25
+    logit_scale_init: 1.60
     logit_scale_min: 0.5
     logit_scale_max: 3.0
     logit_scale_learnable: true
@@ -58,7 +58,7 @@ training_worker:
       restarts: null
     head_hidden: 64
     head_momentum: 0.9
-    unfreeze_at_conf: 0.13
+    unfreeze_at_conf: 0.0
     solver:
       type: anderson
       anderson_m: 4
@@ -123,7 +123,7 @@ training_service:
   temperature: 1.0
   logit_scale: 1.25
   logit_scale_learnable: false
-  logit_scale_init: 1.25
+  logit_scale_init: 1.60
   logit_scale_min: 0.5
   logit_scale_max: 3.0
   fp_damping: 0.85
@@ -135,7 +135,7 @@ training_service:
   augment: true
   head_hidden: 64
   head_momentum: 0.9
-  unfreeze_at_conf: 0.20
+  unfreeze_at_conf: 0.0
   ema_decay: 0.999
 
 train:
@@ -147,10 +147,10 @@ train:
   head_ln: true
   head_dropout: 0.10
   learn_logit_scale: true
-  logit_scale_init: 1.50
+  logit_scale_init: 1.60
   logit_scale_min: 0.50
   logit_scale_max: 3.00
-  unfreeze_at_conf: 0.20
+  unfreeze_at_conf: 0.0
 
   optimizer: adamw
   head_lr: 0.003
@@ -169,7 +169,7 @@ train:
   anderson_ridge: 1.0e-4
   line_search: true
   tol: 1.0e-5
-  fp_err_guard: 5.0
+  fp_err_guard: 1.0e-3
   spectral_rho: 0.90
   lambda_contr: 1.0e-4
   fp_damping: 0.85

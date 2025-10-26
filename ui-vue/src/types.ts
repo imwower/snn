@@ -65,6 +65,7 @@ export interface MetricPayload {
   avg_throughput?: number;
   epoch_sec?: number;
   time_unix?: number;
+  low_conf_streak?: number;
 }
 
 export interface MetricEntry extends MetricPayload {

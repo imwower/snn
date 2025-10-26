@@ -119,6 +119,7 @@ class NatsJetStreamQueue(MessageQueue):
         self._durable = durable
         self._request_timeout = request_timeout
         self._allow_reconnect = allow_reconnect
+        self._fallback_queue: Optional[InMemoryQueue] = None
 
         self._loop = loop or asyncio.new_event_loop()
         self._owns_loop = loop is None
@@ -134,6 +135,8 @@ class NatsJetStreamQueue(MessageQueue):
             self._ensure_connected()
 
     def _ensure_connected(self) -> None:
+        if self._get_fallback_queue() is not None:
+            return
         if self._connected:
             return
 
@@ -147,7 +150,10 @@ class NatsJetStreamQueue(MessageQueue):
             self._jetstream = self._nats.jetstream()
             try:
                 await self._jetstream.add_stream(name=self._stream, subjects=self._subjects)
-            except NatsError:
+            except NatsError as exc:
+                if self._is_storage_unavailable_error(exc):
+                    self._enable_fallback(exc)
+                    return
                 pass
             self._connected = True
 
@@ -173,7 +179,26 @@ class NatsJetStreamQueue(MessageQueue):
             return True
         return False
 
+    @staticmethod
+    def _is_storage_unavailable_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "error creating store for stream" in message
+
+    @staticmethod
+    def _is_stream_missing_error(exc: Exception) -> bool:
+        return isinstance(exc, (JetStreamNoStreamResponseError, NoRespondersError))
+
+    def _get_fallback_queue(self) -> Optional[InMemoryQueue]:
+        return getattr(self, "_fallback_queue", None)
+
+    def _enable_fallback(self, reason: Exception) -> None:
+        if self._get_fallback_queue() is None:
+            self._fallback_queue = InMemoryQueue()
+            logger.warning("JetStream 存储不可用，降级为内存队列：%s", reason)
+
     async def _recreate_stream(self) -> None:
+        if self._get_fallback_queue() is not None:
+            return
         assert self._jetstream is not None
         try:
             subjects = self._subjects
@@ -188,11 +213,25 @@ class NatsJetStreamQueue(MessageQueue):
         except Exception as exc:  # pragma: no cover - 仅记录日志
             logger.warning("删除 JetStream 流 %s 失败：%s", self._stream, exc)
             subjects = self._subjects
-        await self._jetstream.add_stream(name=self._stream, subjects=subjects)
-        logger.warning("JetStream 流 %s 已重建，主题 %s", self._stream, self._subject)
+        try:
+            await self._jetstream.add_stream(name=self._stream, subjects=subjects)
+            logger.warning("JetStream 流 %s 已重建，主题 %s", self._stream, self._subject)
+        except Exception as exc:
+            if self._is_storage_unavailable_error(exc) or self._is_stream_missing_error(exc):
+                self._enable_fallback(exc)
+                return
+            raise
 
     def publish(self, subject: str, data: bytes, *, headers: Optional[Dict[str, str]] = None) -> None:
+        fallback = self._get_fallback_queue()
+        if fallback is not None:
+            fallback.publish(subject, data, headers=headers)
+            return
         self._ensure_connected()
+        fallback = self._get_fallback_queue()
+        if fallback is not None:
+            fallback.publish(subject, data, headers=headers)
+            return
         assert self._jetstream is not None
 
         async def _publish() -> None:
@@ -202,16 +241,29 @@ class NatsJetStreamQueue(MessageQueue):
                     await self._jetstream.publish(subject, payload=data, headers=headers or {})
                     return
                 except Exception as exc:
+                    if self._is_storage_unavailable_error(exc):
+                        self._enable_fallback(exc)
+                        break
                     attempts += 1
                     if attempts > 1 or not self._should_recover_stream(exc):
                         raise
                     logger.warning("检测到 JetStream 存储异常，尝试重建流 %s：%s", self._stream, exc)
                     await self._recreate_stream()
 
+        fallback = self._get_fallback_queue()
+        if fallback is not None:
+            fallback.publish(subject, data, headers=headers)
+            return
         self._submit(_publish())
 
     def pull(self, subject: str, *, max_messages: int = 1) -> List[Message]:
+        fallback = self._get_fallback_queue()
+        if fallback is not None:
+            return fallback.pull(subject, max_messages=max_messages)
         self._ensure_connected()
+        fallback = self._get_fallback_queue()
+        if fallback is not None:
+            return fallback.pull(subject, max_messages=max_messages)
         assert self._jetstream is not None
 
         async def _pull() -> List[Message]:
@@ -230,16 +282,27 @@ class NatsJetStreamQueue(MessageQueue):
                         await msg.ack()
                     return result
                 except Exception as exc:
+                    if self._is_storage_unavailable_error(exc):
+                        self._enable_fallback(exc)
+                        break
                     attempts += 1
                     if attempts > 1 or not self._should_recover_stream(exc):
                         raise
                     logger.warning("拉取 JetStream 消息时检测到存储异常，尝试重建流 %s：%s", self._stream, exc)
                     await self._recreate_stream()
 
+        fallback = self._get_fallback_queue()
+        if fallback is not None:
+            return fallback.pull(subject, max_messages=max_messages)
         future = asyncio.run_coroutine_threadsafe(_pull(), self._loop)
         return future.result(timeout=self._request_timeout)
 
     def close(self) -> None:
+        fallback = self._get_fallback_queue()
+        if fallback is not None:
+            fallback.close()
+            self._fallback_queue = None
+            return
         if not self._connected:
             return
 

@@ -469,7 +469,7 @@ class FPTBlock:
 
         trace: List[Tuple[int, float, float]] = []
         h_init = np.asarray(h0, dtype=np.float64)
-        h_next, k_eff, fp_err, iter_err = fpt_solve(
+        h_next, k_eff, fp_err, iter_err, solver_used = fpt_solve(
             _phi,
             h_init,
             K,
@@ -484,7 +484,7 @@ class FPTBlock:
             logger=logger,
             trace=trace,
         )
-        return h_next.astype(np.float32), k_eff, fp_err, iter_err
+        return h_next.astype(np.float32), k_eff, fp_err, iter_err, solver_used
 # ---------------------------------------------------------------------
 # Optimizer & Scheduler
 # ---------------------------------------------------------------------
@@ -643,7 +643,7 @@ class NPTrainer:
         head_dropout = float(self.tr.get("head_dropout", 0.0))
         head_dropout = float(np.clip(head_dropout, 0.0, 0.99))
         learn_scale = bool(self.tr.get("learn_logit_scale", True))
-        logit_scale_init = float(self.tr.get("logit_scale_init", 1.25))
+        logit_scale_init = float(self.tr.get("logit_scale_init", 1.60))
         scale_lo = float(self.tr.get("logit_scale_min", 0.5))
         scale_hi = float(self.tr.get("logit_scale_max", 3.0))
         scale_bounds = (min(scale_lo, scale_hi), max(scale_lo, scale_hi))
@@ -666,12 +666,15 @@ class NPTrainer:
             logit_scale_init=logit_scale_init,
             scale_bounds=scale_bounds,
         )
+        solver_cfg = self.tr.get("solver", "anderson").lower()
+        ema_decay_cfg = float(self.tr.get("ema_decay", 0.0))
+        ema_in_use = 0.0 < ema_decay_cfg < 1.0
 
         # Optimizer / Scheduler
         head_lr = float(self.tr.get("head_lr", self.tr.get("lr", 1e-3)))
         rec_lr  = float(self.tr.get("rec_lr",  self.tr.get("lr", 1e-3)))
         head_only = bool(self.tr.get("head_only", True))
-        unfreeze_at_conf = float(self.tr.get("unfreeze_at_conf", 0.20))
+        unfreeze_at_conf = float(self.tr.get("unfreeze_at_conf", 0.15))
         weight_decay_head = float(self.tr.get("weight_decay_head", self.tr.get("weight_decay", 1e-4)))
         weight_decay_rec = float(self.tr.get("weight_decay_rec", self.tr.get("weight_decay", 1e-4)))
         grad_clip = float(self.tr.get("grad_clip", 1.0))
@@ -680,7 +683,7 @@ class NPTrainer:
         min_lr_ratio = float(self.tr.get("min_lr_ratio", 0.1))
         fp_damping = float(self.tr.get("fp_damping", 1.0))
         line_search_cfg = as_bool(self.tr.get("line_search", True), True)
-        fp_guard = float(self.tr.get("fp_err_guard", 5.0))
+        fp_guard = float(self.tr.get("fp_err_guard", 1e-3))
         val_max_steps = int(self.tr.get("val_max_steps", 0))
 
         param_groups = [
@@ -723,7 +726,7 @@ class NPTrainer:
             self.sb["logs"],
             f"trainer start mode={self.mode} hidden={hidden} head_hidden={head_hidden} head_only={head_only} "
             f"ln={head_ln} dropout={head_dropout:.2f} lr_head={head_lr} lr_rec={rec_lr} "
-            f"logit_scale={float(head.logit_scale[0])} steps/ep={steps_per_epoch}",
+            f"logit_scale={float(head.logit_scale[0])} solver={solver_cfg} steps/ep={steps_per_epoch}",
         )
 
         best_acc = 0.0
@@ -735,9 +738,34 @@ class NPTrainer:
         rate_lambda = float(self.tr.get("rate_reg_lambda", 0.0))
 
         for ep in range(1, epochs+1):
-            t0 = time.time()
+            t0 = time.perf_counter()
             seen = 0; corr = 0; loss_sum = 0.0; steps = 0
             top5_acc_sum = 0.0
+            train_meter = {
+                "count": 0,
+                "loss": 0.0,
+                "acc": 0.0,
+                "top5": 0.0,
+                "conf": 0.0,
+                "entropy": 0.0,
+                "logit_mean": 0.0,
+                "logit_std": 0.0,
+                "logit_scale": 0.0,
+                "grad_norm": 0.0,
+                "delta_norm": 0.0,
+                "gnorm_rec": 0.0,
+                "gnorm_rec_count": 0,
+                "lr_head": 0.0,
+                "lr_rec": 0.0,
+                "lr_rec_count": 0,
+                "throughput": 0.0,
+                "s_rate": 0.0,
+                "s_rate_count": 0,
+                "fp_err": 0.0,
+                "fp_err_count": 0,
+                "iter_err": 0.0,
+                "iter_err_count": 0,
+            }
             # optional anneal g_apical/beta/v_th for T-step
             if self.mode == "tstep":
                 g0 = float(self.tr.get("g_apical_start", core.g))
@@ -751,20 +779,22 @@ class NPTrainer:
 
             # train loop
             last_conf_b = None
+            low_conf_streak = 0
             for step, (xb, yb) in enumerate(iter_minibatches(Xtr, ytr, batch, steps_per_epoch, augment=augment), start=1):
                 fp_err = None
                 iter_err = None
                 global_step += 1
                 # forward (core)
+                skip_updates_due_fp = False
                 if self.mode == "tstep":
                     S, s_mean = core.forward_states(xb)
                     Z = s_mean
                 else:
                     K_max = int(self.tr.get("K", 4))
                     tol = float(self.tr.get("tol", 1e-5))
-                    solver = self.tr.get("solver", "anderson").lower()
                     h0 = np.zeros((xb.shape[0], hidden), np.float32)
-                    hK, k_eff, fp_err, iter_err = FPTBlock.anderson_solve(
+                    beta_use = float(self.tr.get("anderson_beta", 0.5))
+                    hK, k_eff, fp_err, iter_err, solver_used = FPTBlock.anderson_solve(
                         xb,
                         h0,
                         core.Wxh,
@@ -773,14 +803,49 @@ class NPTrainer:
                         K=K_max,
                         tol=tol,
                         m=int(self.tr.get("anderson_m", 4)),
-                        beta=float(self.tr.get("anderson_beta", 0.5)),
-                        solver=solver,
+                        beta=beta_use,
+                        solver=solver_cfg,
                         line_search=line_search_cfg,
                         ridge=float(self.tr.get("anderson_ridge", 1e-4)),
                         fp_err_guard=fp_guard,
                         damping=fp_damping,
                         logger=log_fpt,
                     )
+                    auto_fallback = solver_used != solver_cfg
+                    bad_fp = fp_err is None or not np.isfinite(fp_err) or (fp_err is not None and fp_err > fp_guard)
+                    if auto_fallback:
+                        fp_err_msg = f"{fp_err:.3e}" if fp_err is not None else "nan"
+                        await send_log(
+                            self.js,
+                            self.sb["logs"],
+                            f"[solver] epoch={ep} step={step} fallback {solver_cfg}->{solver_used} "
+                            f"k={int(k_eff)} fp_err={fp_err_msg}",
+                        )
+                    if bad_fp:
+                        skip_updates_due_fp = True
+                        fp_err_msg = f"{fp_err:.3e}" if fp_err is not None else "nan"
+                        await send_log(
+                            self.js,
+                            self.sb["logs"],
+                            f"[solver] epoch={ep} step={step} fp_err={fp_err_msg} trigger plain fallback",
+                        )
+                        hK, k_eff, fp_err, iter_err, solver_used = FPTBlock.anderson_solve(
+                            xb,
+                            h0,
+                            core.Wxh,
+                            core.Whh,
+                            core.bh,
+                            K=max(K_max, 6),
+                            tol=tol,
+                            m=1,
+                            beta=0.2,
+                            solver="plain",
+                            line_search=False,
+                            ridge=float(self.tr.get("anderson_ridge", 1e-4)),
+                            fp_err_guard=fp_guard,
+                            damping=fp_damping,
+                            logger=log_fpt,
+                        )
                     Z = hK
                     await js_publish(
                         self.js,
@@ -789,10 +854,9 @@ class NPTrainer:
                             "epoch": ep,
                             "step": step,
                             "k": int(k_eff),
-                            "residual": float(fp_err),
-                            "fp_err": float(fp_err),
-                            "iter_err": float(iter_err),
-                            "solver": solver,
+                            "solver": solver_used,
+                            "residual": float(fp_err) if fp_err is not None else None,
+                            "iter_err": float(iter_err) if iter_err is not None else None,
                             "ts": time.time(),
                         },
                     )
@@ -824,8 +888,19 @@ class NPTrainer:
                 logit_std  = float(np.std(logits))
 
                 conf_drop = last_conf_b is not None and (last_conf_b - conf_b) > 0.1
-                skip_update = logit_std > 10.0 or conf_drop
-                if skip_update:
+                low_conf_streak = low_conf_streak + 1 if conf_b < 0.18 else 0
+                if low_conf_streak >= 200:
+                    prev_scale = float(head.logit_scale[0])
+                    head.logit_scale[...] = np.clip(head.logit_scale * 1.1, scale_bounds[0], scale_bounds[1])
+                    low_conf_streak = 0
+                    await send_log(
+                        self.js,
+                        self.sb["logs"],
+                        f"[auto-calibrate] epoch={ep} step={step} logit_scale {prev_scale:.4f}->{float(head.logit_scale[0]):.4f}",
+                    )
+                skip_reason_conf = logit_std > 10.0 or conf_drop
+                skip_update = skip_reason_conf or skip_updates_due_fp
+                if skip_reason_conf:
                     head.logit_scale[...] = np.clip(head.logit_scale * 0.8, scale_bounds[0], scale_bounds[1])
                     await send_log(
                         self.js,
@@ -852,7 +927,7 @@ class NPTrainer:
                 sch.step()
 
                 # rate regularization (T-step only; monitor; no gradient to head)
-                rate = 0.0
+                rate = None
                 reg_loss = 0.0
                 if self.mode == "tstep":
                     rate = float(np.mean(Z))
@@ -880,13 +955,16 @@ class NPTrainer:
                 rec_stats = None
                 if has_rec_group:
                     rec_stats = stats.get("rec", {"grad_norm": 0.0, "delta_norm": 0.0})
+                batch_loss = float(nll)
+                scale_value = float(head.logit_scale[0])
                 payload = {
                     "epoch": ep, "step": step,
-                    "loss": float(nll), "acc": acc_b, "top5": top5_b,
+                    "loss": batch_loss, "acc": acc_b, "top5": top5_b,
                     "throughput": tps, "lr": lr_head_val,
-                    "nll": float(nll), "conf": conf_b, "entropy": entropy_b,
+                    "nll": batch_loss, "conf": conf_b, "entropy": entropy_b,
                     "logit_mean": logit_mean, "logit_std": logit_std,
-                    "logit_scale": float(head.logit_scale[0]),
+                    "logit_scale": scale_value,
+                    "low_conf_streak": int(low_conf_streak),
                     "s_rate": rate if self.mode == "tstep" else None,
                     "grad_norm": head_stats["grad_norm"], "delta_norm": head_stats["delta_norm"],
                     "gnorm_head": head_stats["grad_norm"],
@@ -899,12 +977,100 @@ class NPTrainer:
                 }
                 await js_publish(self.js, self.sb["metrics"], payload)
 
+                train_meter["count"] += 1
+                train_meter["loss"] += batch_loss
+                train_meter["acc"] += acc_b
+                train_meter["top5"] += top5_b
+                train_meter["conf"] += conf_b
+                train_meter["entropy"] += entropy_b
+                train_meter["logit_mean"] += logit_mean
+                train_meter["logit_std"] += logit_std
+                train_meter["logit_scale"] += scale_value
+                train_meter["grad_norm"] += head_stats["grad_norm"]
+                train_meter["delta_norm"] += head_stats["delta_norm"]
+                train_meter["lr_head"] += lr_head_val
+                train_meter["throughput"] += tps
+                if rate is not None:
+                    train_meter["s_rate"] += rate
+                    train_meter["s_rate_count"] += 1
+                if (not head_only) and rec_stats and rec_stats["grad_norm"] is not None:
+                    train_meter["gnorm_rec"] += rec_stats["grad_norm"]
+                    train_meter["gnorm_rec_count"] += 1
+                if (not head_only) and lr_rec_val is not None:
+                    train_meter["lr_rec"] += lr_rec_val
+                    train_meter["lr_rec_count"] += 1
+                if fp_err is not None:
+                    train_meter["fp_err"] += float(fp_err)
+                    train_meter["fp_err_count"] += 1
+                if iter_err is not None:
+                    train_meter["iter_err"] += float(iter_err)
+                    train_meter["iter_err_count"] += 1
+
                 # optional spikes (visual)
                 if step % 10 == 0:
                     await self._emit_spikes(Z)
 
                 head.clamp_scale()
                 last_conf_b = conf_b
+
+            steps_recorded = train_meter["count"]
+            if steps_recorded > 0:
+                avg = lambda key: train_meter[key] / max(1, steps_recorded)
+                lr_rec_avg = (
+                    train_meter["lr_rec"] / max(1, train_meter["lr_rec_count"])
+                    if train_meter["lr_rec_count"] > 0
+                    else None
+                )
+                gnorm_rec_avg = (
+                    train_meter["gnorm_rec"] / max(1, train_meter["gnorm_rec_count"])
+                    if train_meter["gnorm_rec_count"] > 0
+                    else None
+                )
+                s_rate_avg = (
+                    train_meter["s_rate"] / max(1, train_meter["s_rate_count"])
+                    if train_meter["s_rate_count"] > 0
+                    else None
+                )
+                fp_err_avg = (
+                    train_meter["fp_err"] / max(1, train_meter["fp_err_count"])
+                    if train_meter["fp_err_count"] > 0
+                    else None
+                )
+                iter_err_avg = (
+                    train_meter["iter_err"] / max(1, train_meter["iter_err_count"])
+                    if train_meter["iter_err_count"] > 0
+                    else None
+                )
+                train_epoch_payload = {
+                    "epoch": ep,
+                    "step": 0,
+                    "phase": "train",
+                    "loss": avg("loss"),
+                    "nll": avg("loss"),
+                    "acc": avg("acc"),
+                    "top5": avg("top5"),
+                    "conf": avg("conf"),
+                    "entropy": avg("entropy"),
+                    "logit_mean": avg("logit_mean"),
+                    "logit_std": avg("logit_std"),
+                    "logit_scale": avg("logit_scale"),
+                    "grad_norm": avg("grad_norm"),
+                    "delta_norm": avg("delta_norm"),
+                    "gnorm_head": avg("grad_norm"),
+                    "gnorm_rec": gnorm_rec_avg,
+                    "throughput": avg("throughput"),
+                    "s_rate": s_rate_avg,
+                    "fp_err": fp_err_avg,
+                    "iter_err": iter_err_avg,
+                    "lr": avg("lr_head"),
+                    "lr_head": avg("lr_head"),
+                    "lr_rec": lr_rec_avg,
+                    "ts": time.time(),
+                    "best_acc": float(best_acc),
+                    "best_loss": float(best_loss),
+                    "ema_in_use": ema_in_use,
+                }
+                await js_publish(self.js, self.sb["metrics"], train_epoch_payload)
 
             if self.mode == "fpt" and not head_only:
                 rho_target = float(self.tr.get("spectral_rho", 0.9))
@@ -922,13 +1088,26 @@ class NPTrainer:
             val_steps_use = math.ceil(Xte.shape[0] / batch)
             if val_max_steps > 0:
                 val_steps_use = min(val_steps_use, val_max_steps)
+            v_entropy_sum = 0.0
+            v_logit_mean_sum = 0.0
+            v_logit_std_sum = 0.0
+            v_fp_err_sum = 0.0
+            v_fp_err_count = 0
+            v_iter_err_sum = 0.0
+            v_iter_err_count = 0
+            v_s_rate_sum = 0.0
+            v_s_rate_count = 0
+            val_loop_start = time.perf_counter()
             for xb, yb in iter_minibatches(Xte, yte, batch, steps_per_epoch=val_steps_use, augment=False):
                 if self.mode == "tstep":
                     _, s_mean = core.forward_states(xb)
                     Z = s_mean
+                    batch_s_rate = float(np.mean(s_mean))
+                    v_s_rate_sum += batch_s_rate
+                    v_s_rate_count += 1
                 else:
                     h0 = np.zeros((xb.shape[0], hidden), np.float32)
-                    hK, _, _, _ = FPTBlock.anderson_solve(
+                    hK, _, fp_err_val, iter_err_val, solver_used_val = FPTBlock.anderson_solve(
                         xb,
                         h0,
                         core.Wxh,
@@ -938,28 +1117,67 @@ class NPTrainer:
                         tol=float(self.tr.get("tol", 1e-5)),
                         m=int(self.tr.get("anderson_m", 4)),
                         beta=float(self.tr.get("anderson_beta", 0.5)),
-                        solver=self.tr.get("solver", "anderson").lower(),
+                        solver=solver_cfg,
                         line_search=line_search_cfg,
                         ridge=float(self.tr.get("anderson_ridge", 1e-4)),
                         fp_err_guard=fp_guard,
                         damping=fp_damping,
                     )
                     Z = hK
+                    if solver_used_val != solver_cfg:
+                        fp_val_msg = f"{fp_err_val:.3e}" if fp_err_val is not None else "nan"
+                        await send_log(
+                            self.js,
+                            self.sb["logs"],
+                            f"[solver] (val) epoch={ep} fallback {solver_cfg}->{solver_used_val} fp_err={fp_val_msg}",
+                        )
+                    if fp_err_val is not None:
+                        v_fp_err_sum += float(fp_err_val)
+                        v_fp_err_count += 1
+                    if iter_err_val is not None:
+                        v_iter_err_sum += float(iter_err_val)
+                        v_iter_err_count += 1
                 logits, _ = head.forward(Z, training=False)
                 nll, probs, _ = softmax_nll(logits, yb)
-                v_loss += float(nll); v_steps += 1
-                v_seen += xb.shape[0]
+                batch_size_eval = xb.shape[0]
+                v_loss += float(nll) * batch_size_eval
+                v_steps += 1
+                v_seen += batch_size_eval
                 pred = np.argmax(probs, axis=1)
-                v_cor += int((pred == yb).sum())
-                v_top5 += topk_acc(probs, yb, k=5)
-                v_conf += float(np.mean(probs[np.arange(yb.shape[0]), yb]))
+                batch_correct = int((pred == yb).sum())
+                v_cor += batch_correct
+                v_top5 += topk_acc(probs, yb, k=5) * batch_size_eval
+                v_conf += float(np.mean(probs[np.arange(yb.shape[0]), yb])) * batch_size_eval
+                entropy_val = float(-np.mean(np.sum(probs * np.log(np.clip(probs, 1e-9, None)), axis=1)))
+                v_entropy_sum += entropy_val * batch_size_eval
+                logit_mean_val = float(np.mean(logits))
+                logit_std_val = float(np.std(logits))
+                v_logit_mean_sum += logit_mean_val * batch_size_eval
+                v_logit_std_sum += logit_std_val * batch_size_eval
 
             train_loss = loss_sum/max(1,steps)
             train_acc  = corr/max(1,seen)
-            val_loss = v_loss/max(1,v_steps)
+            val_loss = v_loss/max(1,v_seen)
             val_acc  = v_cor/max(1,v_seen)
-            top5_epoch = v_top5/max(1,v_steps)
-            v_conf_epoch = v_conf/max(1,v_steps)
+            top5_epoch = v_top5/max(1,v_seen)
+            v_conf_epoch = v_conf/max(1,v_seen)
+            val_entropy_avg = v_entropy_sum / max(1, v_seen)
+            val_logit_mean_avg = v_logit_mean_sum / max(1, v_seen)
+            val_logit_std_avg = v_logit_std_sum / max(1, v_seen)
+            val_s_rate_avg = (
+                v_s_rate_sum / max(1, v_s_rate_count) if v_s_rate_count > 0 else None
+            )
+            val_fp_err_avg = (
+                v_fp_err_sum / max(1, v_fp_err_count) if v_fp_err_count > 0 else None
+            )
+            val_iter_err_avg = (
+                v_iter_err_sum / max(1, v_iter_err_count) if v_iter_err_count > 0 else None
+            )
+            val_elapsed = max(1e-6, time.perf_counter() - val_loop_start)
+            val_throughput = v_seen / val_elapsed
+            val_lr_head = opt.get_group_lr("head") or head_lr
+            val_lr_rec = opt.get_group_lr("rec") if (has_rec_group and not head_only) else None
+            logit_scale_val = float(head.logit_scale[0])
 
             best_acc = max(best_acc, val_acc)
             best_loss = min(best_loss, val_loss)
@@ -967,17 +1185,28 @@ class NPTrainer:
             # epoch metrics
             await js_publish(self.js, self.sb["metrics"], {
                 "epoch": ep, "step": 0,
-                "loss": float(val_loss), "acc": float(val_acc), "top5": float(top5_epoch),
-                "throughput": 0.0, "lr": opt.get_group_lr("head") or head_lr,
-                "nll": float(val_loss), "conf": float(v_conf_epoch), "entropy": None,
-                "logit_mean": None, "logit_std": None,
-                "s_rate": None,
+                "phase": "val",
+                "loss": float(val_loss), "nll": float(val_loss),
+                "acc": float(val_acc), "top5": float(top5_epoch),
+                "conf": float(v_conf_epoch), "entropy": val_entropy_avg,
+                "logit_mean": val_logit_mean_avg, "logit_std": val_logit_std_avg,
+                "logit_scale": logit_scale_val,
+                "grad_norm": None, "delta_norm": None,
+                "gnorm_head": None, "gnorm_rec": None,
+                "throughput": val_throughput,
+                "s_rate": val_s_rate_avg,
+                "fp_err": val_fp_err_avg,
+                "iter_err": val_iter_err_avg,
+                "lr": val_lr_head,
+                "lr_head": val_lr_head,
+                "lr_rec": val_lr_rec,
                 "best_acc": float(best_acc), "best_loss": float(best_loss),
-                "phase": "val", "ts": time.time()
+                "ema_in_use": ema_in_use,
+                "ts": time.time()
             })
 
             # log line
-            sec = time.time()-t0
+            sec = time.perf_counter()-t0
             await send_log(self.js, self.sb["logs"],
                            f"[epoch {ep}/{epochs}] train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
                            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} top5={top5_epoch:.4f} "

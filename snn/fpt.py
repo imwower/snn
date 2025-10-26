@@ -44,6 +44,7 @@ class FixedPointResult:
     effective_iterations: int = 0
     final_fp_error: float = 0.0
     final_iter_error: float = 0.0
+    solver_used: str = "anderson"
 
 
 def _to_list(seq: Sequence[float], *, name: str) -> List[float]:
@@ -146,7 +147,7 @@ def fpt_solve(
     logger: Optional[logging.Logger] = None,
     trace: Optional[List[Tuple[int, float, float]]] = None,
     allow_fallback: bool = True,
-) -> Tuple[np.ndarray, int, float, float]:
+) -> Tuple[np.ndarray, int, float, float, str]:
     """Generic fixed-point solver with optional Anderson acceleration."""
 
     if K_max <= 0:
@@ -164,6 +165,7 @@ def fpt_solve(
     fp_err_final = float("inf")
     iter_err_final = 0.0
     effective_k = 0
+    solver_used = solver_name
     if logger:
         logger.info(
             "固定点迭代开始：dim=%d, 迭代次数=%d, 阈值=%.2e, solver=%s",
@@ -220,7 +222,7 @@ def fpt_solve(
             if use_anderson and allow_fallback:
                 if logger:
                     logger.warning("ANDERSON->PLAIN fallback (fp_err=%.3e)", fp_err_next)
-                return fpt_solve(
+                fallback_state, fallback_k, fallback_fp_err, fallback_iter_err, fallback_solver = fpt_solve(
                     phi,
                     state,
                     max(K_max, 6),
@@ -236,10 +238,17 @@ def fpt_solve(
                     trace=trace,
                     allow_fallback=False,
                 )
+                return (
+                    fallback_state,
+                    fallback_k,
+                    fallback_fp_err,
+                    fallback_iter_err,
+                    fallback_solver,
+                )
             fp_err_final = fp_err_next
             iter_err_final = iter_err
             effective_k = iteration
-            return new_state.astype(np.float64, copy=False), effective_k, fp_err_final, iter_err_final
+            return new_state.astype(np.float64, copy=False), effective_k, fp_err_final, iter_err_final, solver_used
 
         state = new_state
         fp_err_final = fp_err_next
@@ -248,7 +257,7 @@ def fpt_solve(
         if fp_err_next <= tol:
             break
 
-    return state.astype(np.float64, copy=False), effective_k, fp_err_final, iter_err_final
+    return state.astype(np.float64, copy=False), effective_k, fp_err_final, iter_err_final, solver_used
 
 
 def _build_three_compartment_phi(
@@ -364,7 +373,7 @@ def fixed_point_parallel_solve(
     )
 
     trace: List[Tuple[int, float, float]] = []
-    h_final, k_eff, fp_err, iter_err = fpt_solve(
+    h_final, k_eff, fp_err, iter_err, solver_used = fpt_solve(
         phi_fn,
         h0,
         config.iterations,
@@ -405,4 +414,5 @@ def fixed_point_parallel_solve(
         effective_iterations=k_eff,
         final_fp_error=fp_err,
         final_iter_error=iter_err,
+        solver_used=solver_used,
     )

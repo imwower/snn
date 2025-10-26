@@ -52,7 +52,9 @@ const defaultBatchSnapshot = () => ({
   emaLoss: null as number | null,
   emaAcc: null as number | null,
   lr: null as number | null,
-  examples: null as number | null
+  examples: null as number | null,
+  logitScale: null as number | null,
+  lowConfStreak: null as number | null
 });
 
 type FinalSummary = {
@@ -236,6 +238,12 @@ export const useUiStore = defineStore('ui', {
       if (typeof payload.examples === 'number') {
         snapshot.examples = payload.examples;
         this.examples = payload.examples;
+      }
+      if (typeof payload.logit_scale === 'number') {
+        snapshot.logitScale = payload.logit_scale;
+      }
+      if (typeof payload.low_conf_streak === 'number') {
+        snapshot.lowConfStreak = payload.low_conf_streak;
       }
     },
     prepareRun(init?: TrainInitEvent) {
