@@ -540,7 +540,8 @@ const animate = () => {
   }
   const delta = clock.getDelta();
   const glowDecay = delta * 0.9;
-  const edgeDecay = delta * 0.75;
+  // Slow down edge fade so highlighted connections stay visible longer
+  const edgeDecay = delta * 0.25;
   let colorDirty = false;
 
   if (glow.length && nodeMesh && nodeColorAttr) {
