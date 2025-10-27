@@ -26,7 +26,10 @@ from typing import Tuple, Dict, Any, Optional
 import urllib.request
 import numpy as np
 import yaml
-import nats
+try:
+    import nats  # type: ignore
+except Exception:  # pragma: no cover - optional dependency for offline mode
+    nats = None
 
 from snn.fpt import fpt_solve
 
@@ -111,11 +114,28 @@ def load_dataset(name: str, data_root: str) -> Tuple[np.ndarray, np.ndarray, np.
     urls = MNIST_URLS if name == "MNIST" else FASHION_URLS if name in ("FASHIONMNIST","FASHION-MNIST") else None
     if urls is None:
         raise ValueError(f"Unsupported dataset: {name}")
+    # Prefer pre-downloaded Keras-style mnist.npz if available under common paths
+    if name == "MNIST":
+        candidates = [
+            os.path.join(data_root, "mnist", "mnist.npz"),
+            os.path.join(data_root, "MNIST", "mnist.npz"),
+            os.path.join(data_root, "mnist.npz"),
+        ]
+        for npz_path in candidates:
+            if os.path.exists(npz_path):
+                with np.load(npz_path) as data:
+                    Xtr = data["x_train"].reshape(data["x_train"].shape[0], -1).astype(np.float32) / 255.0
+                    ytr = data["y_train"].astype(np.int64)
+                    Xte = data["x_test"].reshape(data["x_test"].shape[0], -1).astype(np.float32) / 255.0
+                    yte = data["y_test"].astype(np.int64)
+                in_dim = Xtr.shape[1]
+                num_classes = 10
+                return Xtr, ytr, Xte, yte, in_dim, num_classes
 
     base = os.path.join(data_root, name)
     ensure_dir(base)
     paths = {k: os.path.join(base, os.path.basename(v)) for k, v in urls.items()}
-    for k,u in urls.items():
+    for k, u in urls.items():
         _dl(u, paths[k])
     Xtr = _read_idx_images(paths["train_images"])
     ytr = _read_idx_labels(paths["train_labels"])
@@ -251,6 +271,46 @@ def l2_norm(arrs) -> float:
             s += float(np.sum(a*a))
         return math.sqrt(s)
     return math.sqrt(float(np.sum(arrs*arrs)))
+
+# ---------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------
+def save_np_checkpoint(path: str, mode: str, core, head) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {}
+    if mode == "fpt":
+        payload.update({
+            "Wxh": np.asarray(core.Wxh, dtype=np.float32),
+            "Whh": np.asarray(core.Whh, dtype=np.float32),
+            "bh":  np.asarray(core.bh,  dtype=np.float32),
+        })
+    else:
+        payload.update({
+            "Wxb": np.asarray(core.Wxb, dtype=np.float32),
+            "Wxa": np.asarray(core.Wxa, dtype=np.float32),
+            "Whb": np.asarray(core.Whb, dtype=np.float32),
+            "Wha": np.asarray(core.Wha, dtype=np.float32),
+            "g":   np.array([float(getattr(core, "g", 0.0))], dtype=np.float32),
+            "tau_m": np.array([float(getattr(core, "tau_m", 0.0))], dtype=np.float32),
+            "tau_a": np.array([float(getattr(core, "tau_a", 0.0))], dtype=np.float32),
+            "tau_b": np.array([float(getattr(core, "tau_b", 0.0))], dtype=np.float32),
+            "v_th": np.array([float(getattr(core, "v_th", 0.0))], dtype=np.float32),
+            "beta": np.array([float(getattr(core, "beta", 0.0))], dtype=np.float32),
+            "T":    np.array([int(getattr(core, "T", 0))], dtype=np.int32),
+        })
+    payload.update({
+        "head_W1": np.asarray(head.W1, dtype=np.float32),
+        "head_b1": np.asarray(head.b1, dtype=np.float32),
+        "head_W2": np.asarray(head.W2, dtype=np.float32),
+        "head_b2": np.asarray(head.b2, dtype=np.float32),
+        "logit_scale": np.asarray(head.logit_scale, dtype=np.float32),
+        "mode": np.array([1 if mode == "fpt" else 0], dtype=np.int32),
+    })
+    if getattr(head, "layer_norm", False):
+        payload["ln_gamma"] = np.asarray(head.ln_gamma, dtype=np.float32)
+        payload["ln_beta"] = np.asarray(head.ln_beta, dtype=np.float32)
+    np.savez_compressed(path, **payload)
+    return path
 
 # ---------------------------------------------------------------------
 # Readout Head (MLP)
@@ -1179,8 +1239,14 @@ class NPTrainer:
             val_lr_rec = opt.get_group_lr("rec") if (has_rec_group and not head_only) else None
             logit_scale_val = float(head.logit_scale[0])
 
+            prev_best = best_acc
             best_acc = max(best_acc, val_acc)
             best_loss = min(best_loss, val_loss)
+
+            # save best checkpoint
+            if val_acc > prev_best:
+                ckpt_path = save_np_checkpoint(os.path.join("checkpoints", "np_trainer_best.npz"), self.mode, core, head)
+                await send_log(self.js, self.sb["logs"], f"[checkpoint] saved best np trainer epoch={ep} acc={val_acc:.4f} path={ckpt_path}")
 
             # epoch metrics
             await js_publish(self.js, self.sb["metrics"], {
@@ -1236,21 +1302,55 @@ def load_cfg(path: str) -> Dict[str, Any]:
 
 async def main_async(args):
     cfg = load_cfg(args.config)
-    nats_url = os.getenv("NATS_URL", cfg["nats"]["url"])
-    nc = await nats.connect(nats_url)
-    js = nc.jetstream()
+    # setup NATS or offline stub with local capture
+    class _LocalCaptureJS:
+        def __init__(self) -> None:
+            self.events = []  # type: ignore[var-annotated]
+        async def publish(self, subject: str, data: bytes, *, headers=None):
+            try:
+                payload = json.loads(data.decode("utf-8"))
+            except Exception:
+                payload = {"raw": data.decode("utf-8", errors="ignore")}
+            self.events.append((subject, payload))
+    js = _LocalCaptureJS()
+    nc = None
+    try:
+        url = os.getenv("NATS_URL") or (cfg.get("nats") or {}).get("url")
+        if nats is not None and url:
+            nc = await nats.connect(url)
+            js = nc.jetstream()
+    except Exception:
+        js = _LocalCaptureJS()
 
-    # subjects map; allow missing train_iter -> fallback to logs
+    # subjects map with robust defaults
+    subj_cfg = cfg.get("subjects") or {}
     subjects = {
-        "metrics": cfg["subjects"].get("metrics", "snn.metrics.training"),
-        "spikes":  cfg["subjects"].get("spikes",  "snn.spikes.layer.1"),
-        "logs":    cfg["subjects"].get("logs",    "snn.ui.log.training"),
-        "train_iter": cfg["subjects"].get("train_iter", cfg["subjects"].get("logs","snn.ui.log.training"))
+        "metrics": subj_cfg.get("metrics", "snn.metrics.training"),
+        "spikes":  subj_cfg.get("spikes",  "snn.spikes.layer.1"),
+        "logs":    subj_cfg.get("logs",    "snn.ui.log.training"),
+        "train_iter": subj_cfg.get("train_iter", subj_cfg.get("logs", "snn.ui.log.training")),
     }
 
     trainer = NPTrainer(cfg, js, subjects)
     await trainer.train()
-    await nc.drain()
+    if nc is not None:
+        await nc.drain()
+    # Print final validation summary when running offline
+    if isinstance(js, _LocalCaptureJS):
+        last = None
+        for (subj, payload) in js.events:
+            if subj == subjects["metrics"] and isinstance(payload, dict) and payload.get("phase") == "val":
+                last = payload
+        if last is not None:
+            print(
+                "FINAL:",
+                {
+                    "epoch": int(last.get("epoch", 0)),
+                    "val_loss": float(last.get("loss", 0.0)),
+                    "val_acc": float(last.get("acc", 0.0)),
+                    "top5": float(last.get("top5", 0.0)),
+                },
+            )
 
 def main():
     ap = argparse.ArgumentParser()

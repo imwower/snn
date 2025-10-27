@@ -2075,6 +2075,10 @@ class TrainingService:
         kernel = self._kernel_cache.get(key)
         if kernel is None:
             kernel = _compute_basal_kernel(self._params, timesteps, config)
+            # L1-normalize time kernel for stable gradient/logit scale
+            l1 = float(np.sum(np.abs(kernel)))
+            if l1 > 1e-12:
+                kernel = (kernel / l1).astype(kernel.dtype, copy=False)
             self._kernel_cache[key] = kernel
         return kernel
 
@@ -2097,9 +2101,6 @@ class TrainingService:
     def _load_mnist(self) -> DatasetBundle:
         dataset_dir = self._data_root / "mnist"
         npz_path = dataset_dir / "mnist.npz"
-        if not npz_path.exists():
-            logger.warning("未找到 MNIST 数据文件，自动生成占位数据集：%s", npz_path)
-            self._generate_placeholder_mnist(npz_path)
         if not npz_path.exists():
             raise FileNotFoundError(f"未找到 MNIST 数据文件：{npz_path}")
         with np.load(npz_path) as data:
@@ -2124,36 +2125,6 @@ class TrainingService:
             image_shape=image_shape,
             name="MNIST",
         )
-
-    def _generate_placeholder_mnist(self, target: Path) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        rng = np.random.default_rng(self._np_seed)
-        train_samples = 512
-        test_samples = 128
-        feature_dim = 28 * 28
-        x_train = rng.random((train_samples, feature_dim), dtype=np.float32)
-        y_train = rng.integers(0, 10, size=train_samples, endpoint=False).astype(np.int64)
-        x_test = rng.random((test_samples, feature_dim), dtype=np.float32)
-        y_test = rng.integers(0, 10, size=test_samples, endpoint=False).astype(np.int64)
-        np.savez(target, x_train=x_train, y_train=y_train, x_test=x_test, y_test=y_test)
-        metadata = {
-            "name": "MNIST",
-            "generated": True,
-            "files": [
-                {
-                    "filename": target.name,
-                    "size_bytes": target.stat().st_size,
-                    "source": "generated://placeholder",
-                }
-            ],
-        }
-        metadata_path = target.parent / "metadata.json"
-        sample_path = target.parent / "sample.txt"
-        try:
-            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-            sample_path.write_text("Dataset placeholder generated locally.\n", encoding="utf-8")
-        except OSError:
-            logger.warning("无法写入 MNIST 占位符元数据：%s", metadata_path)
 
     def _load_fashion_mnist(self) -> DatasetBundle:
         dataset_dir = self._data_root / "fashion"

@@ -1,5 +1,8 @@
 """Training utilities for NumPy-based ThreeCompartment SNNs."""
 
-from .train_numpy import main, run_worker
+try:
+    from .train_numpy import main  # type: ignore
+except Exception:  # pragma: no cover - allow module-level import without hard deps
+    main = None  # type: ignore
 
-__all__ = ["main", "run_worker"]
+__all__ = ["main"]
