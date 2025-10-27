@@ -45,9 +45,10 @@ const baseNodeColor = new THREE.Color('#1d4ed8');
 const highlightNodeColor = new THREE.Color('#fde047');
 const baseEdgeColor = new THREE.Color('#1f2937');
 const highlightEdgeColor = new THREE.Color('#f97316');
-const baseEdgeOpacity = 0.06;
-const maxEdgeOpacity = 0.35;
-const edgeOpacityRamp = 0.45;
+// Make edges more transparent to improve readability when dense
+const baseEdgeOpacity = 0.03;
+const maxEdgeOpacity = 0.22;
+const edgeOpacityRamp = 0.35;
 const layerLabelOffset = 1.8;
 const layerLabelLift = 0.4;
 const layerLabelScale = 0.015;

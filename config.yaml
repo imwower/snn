@@ -110,11 +110,11 @@ training_service:
   min_lr: null
   weight_decay: 0.0001
   grad_clip: 1.0
-  K: 10
+  K: 12
   tol: 5.0e-6
   T: 12
   solver: anderson
-  anderson_m: 10
+  anderson_m: 12
   anderson_beta: 0.5
   anderson_ridge: 1.0e-4
   line_search: true
@@ -167,8 +167,8 @@ train:
   min_lr_ratio: 0.07
 
   solver: anderson
-  K: 10
-  anderson_m: 10
+  K: 12
+  anderson_m: 12
   anderson_beta: 0.5
   anderson_ridge: 1.0e-4
   line_search: true

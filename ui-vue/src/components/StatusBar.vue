@@ -39,6 +39,21 @@
             </svg>
             <span class="spark-label">logit_scale</span>
           </div>
+          <div class="sparkline-block">
+            <svg class="sparkline acc" viewBox="0 0 100 30" preserveAspectRatio="none">
+              <polyline
+                v-if="accSparkPoints"
+                :points="accSparkPoints"
+                fill="none"
+                stroke="#10b981"
+                stroke-width="1.5"
+                stroke-linejoin="round"
+                stroke-linecap="round"
+              />
+              <line x1="0" y1="28" x2="100" y2="28" stroke="rgba(255,255,255,0.12)" stroke-width="1" />
+            </svg>
+            <span class="spark-label">acc</span>
+          </div>
         </div>
         <div class="metric-badges">
           <span class="badge">epoch: {{ metric.epoch }}</span>
@@ -176,6 +191,7 @@ const computeSparkPoints = (selector: (entry: MetricEntry) => number | null | un
 
 const lossSparkPoints = computed(() => computeSparkPoints((entry) => entry.loss));
 const temperatureSparkPoints = computed(() => computeSparkPoints((entry) => entry.logit_scale));
+const accSparkPoints = computed(() => computeSparkPoints((entry) => entry.acc));
 
 const message = computed(() => {
   if (store.isDownloadActive) {
