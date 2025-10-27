@@ -72,8 +72,9 @@ type FinalSummary = {
 const buildLayout = (cfg: TrainingConfig): LayerLayout[] => {
   const layers: LayerLayout[] = [];
   const perLayer = Math.max(1, Math.ceil(cfg.network_size / Math.max(1, cfg.layers)));
-  const layerSpacing = 12;
-  const gridSpacing = 1.4;
+  // Dynamically scale spacing to keep large networks readable
+  const baseLayerSpacing = 12;
+  const layerSpacing = Math.min(28, baseLayerSpacing + Math.max(0, cfg.layers - 2) * 2.0);
 
   for (let layerIndex = 0; layerIndex < cfg.layers; layerIndex += 1) {
     const count = perLayer;
@@ -81,6 +82,8 @@ const buildLayout = (cfg: TrainingConfig): LayerLayout[] => {
     const columns = Math.ceil(Math.sqrt(count));
     const rows = Math.ceil(count / columns);
     const x = (layerIndex - (cfg.layers - 1) / 2) * layerSpacing;
+    // Grid spacing grows with sqrt(count) but is clamped for stability
+    const gridSpacing = Math.min(2.6, Math.max(1.2, 1.0 + 0.05 * Math.sqrt(count)));
 
     for (let i = 0; i < count; i += 1) {
       const row = Math.floor(i / columns);
