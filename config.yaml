@@ -102,11 +102,11 @@ training_service:
   mode: fpt
   network_size: 128
   layers: 2
-  epochs: 40
+  epochs: 60
   lr: 0.001
   scheduler: warmup_cosine
   warmup_steps: 200
-  min_lr_scale: 0.3
+  min_lr_scale: 0.2
   min_lr: null
   weight_decay: 0.0001
   grad_clip: 1.0
@@ -114,8 +114,8 @@ training_service:
   tol: 5.0e-6
   T: 12
   solver: anderson
-  anderson_m: 4
-  anderson_beta: 0.5
+  anderson_m: 6
+  anderson_beta: 0.4
   anderson_ridge: 1.0e-4
   line_search: true
   fp_err_guard: 5.0
@@ -126,14 +126,14 @@ training_service:
   logit_scale_init: 1.60
   logit_scale_min: 0.5
   logit_scale_max: 3.0
-  fp_damping: 0.85
+  fp_damping: 0.8
   tstep_regularization:
     rate_reg_lambda: 0.001
     rate_target: 0.2
   rate_reg_lambda: 0.001
   rate_target: 0.2
   augment: true
-  head_hidden: 64
+  head_hidden: 96
   head_momentum: 0.9
   unfreeze_at_conf: 0.0
   ema_decay: 0.999
@@ -143,9 +143,10 @@ train:
   steps_per_epoch: 0          # 0 -> ceil(N/batch)
   augment: true
 
+  epochs: 60
   head_hidden: 256
   head_ln: true
-  head_dropout: 0.10
+  head_dropout: 0.20
   learn_logit_scale: true
   logit_scale_init: 1.60
   logit_scale_min: 0.50
@@ -161,18 +162,18 @@ train:
 
   scheduler: warmup_cosine
   warmup_ratio: 0.05
-  min_lr_ratio: 0.10
+  min_lr_ratio: 0.07
 
   solver: anderson
-  anderson_m: 4
-  anderson_beta: 0.5
+  anderson_m: 6
+  anderson_beta: 0.4
   anderson_ridge: 1.0e-4
   line_search: true
   tol: 1.0e-5
   fp_err_guard: 1.0e-3
   spectral_rho: 0.90
   lambda_contr: 1.0e-4
-  fp_damping: 0.85
+  fp_damping: 0.80
   rho_max: 0.9
 
   rate_reg_lambda: 1.0e-3

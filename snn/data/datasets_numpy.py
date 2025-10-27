@@ -49,6 +49,10 @@ def augment_flat_batch(
     *,
     max_translate: int = 2,
     max_crop: int = 2,
+    cutout_prob: float = 0.4,
+    cutout_size: int = 4,
+    jitter_prob: float = 0.35,
+    jitter_sigma: float = 0.08,
 ) -> np.ndarray:
     if image_shape is None or flat_batch.size == 0:
         return flat_batch
@@ -84,7 +88,17 @@ def augment_flat_batch(
         x_start = min(crop_left, w - 1)
         x_end = max(x_start + 1, w - crop_right)
         cropped = translated[y_start:y_end, x_start:x_end, :]
-        augmented[idx] = _pad_to_shape(cropped, (h, w, c), crop_top, crop_bottom, crop_left, crop_right)
+        sample = _pad_to_shape(cropped, (h, w, c), crop_top, crop_bottom, crop_left, crop_right)
+        if cutout_prob > 0.0 and cutout_size > 0 and rng.random() < cutout_prob:
+            max_size = min(cutout_size, h, w)
+            size = int(rng.integers(1, max_size + 1))
+            y0 = int(rng.integers(0, max(1, h - size + 1)))
+            x0 = int(rng.integers(0, max(1, w - size + 1)))
+            sample[y0:y0 + size, x0:x0 + size, :] = 0.0
+        if jitter_prob > 0.0 and jitter_sigma > 0.0 and rng.random() < jitter_prob:
+            noise = rng.normal(0.0, jitter_sigma, size=sample.shape).astype(np.float32)
+            sample = np.clip(sample + noise, 0.0, 1.0)
+        augmented[idx] = sample
     return augmented.reshape(flat_batch.shape[0], -1)
 
 
