@@ -27,15 +27,17 @@ const SPIKE_STREAM_TIMEOUT_MS = 1500;
 const defaultConfig = (): TrainingConfig => ({
   dataset: 'MNIST',
   mode: 'fpt',
-  network_size: 128,
-  layers: 2,
+  // Larger network and more layers for richer visualization
+  network_size: 512,
+  layers: 4,
+  // Recommended FPT solver settings
   lr: 1e-3,
-  K: 6,
-  tol: 5e-6,
+  K: 12,
+  tol: 1e-5,
   T: 12,
-  epochs: 40,
+  epochs: 60,
   solver: 'anderson',
-  anderson_m: 4,
+  anderson_m: 12,
   anderson_beta: 0.5,
   K_schedule: 'auto'
 });
